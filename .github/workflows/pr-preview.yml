@@ -1,0 +1,217 @@
+name: PR Preview
+
+on:
+  workflow_call:
+    inputs:
+      dev-api-url:
+        required: true
+        type: string
+      dev-ui-bucket:
+        required: true
+        type: string
+      preview-domain:
+        required: true
+        type: string
+      enable-preview-deploy:
+        required: false
+        type: string
+        default: 'true'
+      playwright-e2e:
+        required: false
+        type: string
+        default: 'true'
+      node-version:
+        required: false
+        type: string
+        default: '20'
+      python-version:
+        required: false
+        type: string
+        default: '3.12'
+    secrets:
+      AWS_GITHUB_ACTIONS_ROLE_ARN:
+        required: true
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            code:
+              - 'ui/**'
+              - 'src/**'
+              - 'backend/**'
+              - 'terraform/**'
+              - 'infra/**'
+              - 'scripts/**'
+
+  agentic-review:
+    name: Agentic PR Review
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Agentic Review
+        run: |
+          echo "🚀 Invoking LiteLLM-powered Agentic Review (Placeholder)"
+          echo "This step would securely request an AI code review using the abstracted LiteLLM endpoint."
+
+  test:
+    name: Test and Lint
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: 'ui/package-lock.json'
+
+      - name: Install UI dependencies
+        working-directory: ./ui
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Lint UI
+        working-directory: ./ui
+        run: npm run lint
+
+      - name: Build UI (dev backend)
+        working-directory: ./ui
+        env:
+          VITE_API_BASE_URL: ${{ inputs.dev-api-url }}
+        run: npm run build
+
+      - name: Upload UI build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: 'pip'
+
+      - name: Run backend tests
+        run: |
+          if [ -d "tests" ]; then
+            pip install pytest
+            pytest -q tests
+          else
+            echo "No python tests found, skipping"
+          fi
+
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('ui/package-lock.json') }}
+          restore-keys: pw-${{ runner.os }}-
+
+      - name: Install Playwright
+        working-directory: ./ui
+        run: |
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
+            npx playwright install-deps chromium
+          else
+            npx playwright install --with-deps chromium
+          fi
+
+      - name: Start UI preview server
+        working-directory: ./ui
+        run: npx vite preview --port 5173 &
+
+      - name: Wait for preview server
+        run: timeout 30 bash -c 'until curl -sf http://localhost:5173 >/dev/null; do sleep 1; done'
+
+      - name: E2E — smoke tests
+        working-directory: ./ui
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:5173
+        run: npm run test:e2e -- e2e/smoke.spec.ts
+
+      - name: Dev API health check
+        id: devapi
+        if: inputs.playwright-e2e == 'true'
+        run: |
+          for i in 1 2 3; do
+            if curl -sf --max-time 15 ${{ inputs.dev-api-url }}/ -o /dev/null; then
+              echo "reachable=true" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::warning::dev API unreachable — skipping backend e2e for this run"
+          echo "reachable=false" >> "$GITHUB_OUTPUT"
+
+      - name: E2E — backend-dependent
+        if: inputs.playwright-e2e == 'true' && steps.devapi.outputs.reachable == 'true'
+        working-directory: ./ui
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:5173
+        run: npm run test:e2e -- e2e/integration.spec.ts
+
+  preview:
+    name: Deploy Ephemeral Preview
+    needs: [changes, test]
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    env:
+      AWS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+      PREVIEW_DEPLOY_ENABLED: ${{ inputs.enable-preview-deploy }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download UI build artifact
+        if: env.PREVIEW_DEPLOY_ENABLED == 'true' && env.AWS_ROLE_ARN != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+
+      - name: Configure AWS credentials
+        id: aws-creds
+        if: env.PREVIEW_DEPLOY_ENABLED == 'true' && env.AWS_ROLE_ARN != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+        continue-on-error: true
+
+      - name: Skip preview (not enabled or no role)
+        if: env.PREVIEW_DEPLOY_ENABLED != 'true' || env.AWS_ROLE_ARN == ''
+        run: echo "Preview deploy disabled or role not configured; skipping."
+
+      - name: Sync UI to per-branch dev prefix
+        id: sync-ui
+        if: steps.aws-creds.outcome == 'success'
+        env:
+          BRANCH_NAME: ${{ github.head_ref }}
+        run: |
+          SAFE_BRANCH=$(echo "$BRANCH_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]' | cut -c 1-63 | sed 's/-$//')
+          aws s3 sync ./ui/dist "s3://${{ inputs.dev-ui-bucket }}/$SAFE_BRANCH/" --delete
+          echo "PREVIEW_URL=https://$SAFE_BRANCH.${{ inputs.preview-domain }}" >> $GITHUB_ENV
+
+      - name: Comment PR
+        uses: mshick/add-pr-comment@v2
+        if: steps.sync-ui.outcome == 'success'
+        with:
+          message: |
+            🚀 **Preview environment ready:** ${{ env.PREVIEW_URL }}
+
+            *Connects to the shared dev backend (`${{ inputs.dev-api-url }}`).*
