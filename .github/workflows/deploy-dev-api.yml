@@ -1,0 +1,76 @@
+name: Deploy Dev API
+
+on:
+  workflow_call:
+    inputs:
+      name-prefix:
+        description: 'Terraform name_prefix (e.g. myapp-dev)'
+        required: true
+        type: string
+      api-repo:
+        description: 'ECR repo suffix (e.g. myapp-dev-api-repo)'
+        required: true
+        type: string
+      aws-region:
+        required: false
+        type: string
+        default: 'us-east-1'
+      ref:
+        description: 'Git ref to build (branch, tag, or SHA)'
+        required: false
+        type: string
+        default: 'main'
+    secrets:
+      AWS_GITHUB_ACTIONS_ROLE_ARN:
+        required: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
+      NAME_PREFIX: ${{ inputs.name-prefix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+
+      - name: Resolve ECR registry and names
+        id: names
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+          echo "ecr_registry=${ECR_REGISTRY}"                >> "$GITHUB_OUTPUT"
+          echo "api_repo=${ECR_REGISTRY}/${{ inputs.api-repo }}" >> "$GITHUB_OUTPUT"
+          echo "api_lambda=${NAME_PREFIX}-api"               >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_DEFAULT_REGION" \
+            | docker login --username AWS --password-stdin "${{ steps.names.outputs.ecr_registry }}"
+
+      - name: Build and push API image
+        run: |
+          docker build \
+            -t "${{ steps.names.outputs.api_repo }}:${{ github.sha }}" \
+            -t "${{ steps.names.outputs.api_repo }}:latest" \
+            -f src/api/Dockerfile .
+          docker push "${{ steps.names.outputs.api_repo }}:${{ github.sha }}"
+          docker push "${{ steps.names.outputs.api_repo }}:latest"
+
+      - name: Update API Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ steps.names.outputs.api_lambda }}" \
+            --image-uri "${{ steps.names.outputs.api_repo }}:${{ github.sha }}" \
+            --region "$AWS_DEFAULT_REGION"
+          aws lambda wait function-updated \
+            --function-name "${{ steps.names.outputs.api_lambda }}" \
+            --region "$AWS_DEFAULT_REGION"
+          echo "API Lambda updated to ${{ github.sha }}"
