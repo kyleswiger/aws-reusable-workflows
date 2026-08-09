@@ -81,6 +81,15 @@ on:
         required: false
         type: string
         default: '{}'
+      lambda-environment-ssm-path:
+        description: >-
+          SSM parameter holding a JSON object of environment variables for the
+          preview Lambda — lets Terraform own a large env instead of inlining
+          it in workflow YAML. Merged under lambda-environment (inline wins);
+          the CI role needs ssm:GetParameter on this path.
+        required: false
+        type: string
+        default: ''
       ecr-repository:
         description: "ECR repository name for the preview image (container mode); pushed as :preview-pr-<N>"
         required: false
@@ -246,8 +255,13 @@ jobs:
         run: |
           set -euo pipefail
           FN="$FUNCTION_NAME"
-          ENV_JSON=$(jq -nc --argjson base "$LAMBDA_ENVIRONMENT" --arg origin "$PREVIEW_ORIGIN" \
-            '{Variables: ($base + {PREVIEW_ORIGIN: $origin})}')
+          SSM_ENV='{}'
+          if [ -n "${{ inputs.lambda-environment-ssm-path }}" ]; then
+            SSM_ENV=$(aws ssm get-parameter --name "${{ inputs.lambda-environment-ssm-path }}" \
+              --with-decryption --query Parameter.Value --output text)
+          fi
+          ENV_JSON=$(jq -nc --argjson ssm "$SSM_ENV" --argjson base "$LAMBDA_ENVIRONMENT" --arg origin "$PREVIEW_ORIGIN" \
+            '{Variables: ($ssm + $base + {PREVIEW_ORIGIN: $origin})}')
 
           if aws lambda get-function --function-name "$FN" >/dev/null 2>&1; then
             echo "Updating existing $FN"
