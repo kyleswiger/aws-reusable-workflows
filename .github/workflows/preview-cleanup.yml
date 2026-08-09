@@ -44,6 +44,10 @@ jobs:
     env:
       PR: ${{ github.event.pull_request.number }}
     steps:
+      - name: Validate PR context
+        run: |
+          [ -n "$PR" ] || { echo "::error::not a pull_request event — no PR number"; exit 1; }
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
