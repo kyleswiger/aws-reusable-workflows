@@ -1,0 +1,85 @@
+# Tear down a PR's preview environment when the PR closes: the per-PR Lambda
+# (+ Function URL), the S3 prefix, the CloudFront cache entries, and the
+# preview image tag (container backends). The preview-substrate's S3 lifecycle
+# rule is the backstop if this never runs.
+#
+# Caller requirements:
+#   permissions: { id-token: write, contents: read }
+#   trigger: pull_request [closed]
+name: Preview Cleanup
+
+on:
+  workflow_call:
+    inputs:
+      preview-bucket:
+        description: "Preview S3 bucket"
+        required: true
+        type: string
+      distribution-id:
+        description: "Preview CloudFront distribution ID"
+        required: true
+        type: string
+      name-prefix:
+        description: "Site name prefix (deletes <name-prefix>-preview-pr-<N>); empty skips Lambda cleanup"
+        required: false
+        type: string
+        default: ''
+      ecr-repository:
+        description: "ECR repository holding :preview-pr-<N> tags; empty skips image cleanup"
+        required: false
+        type: string
+        default: ''
+      aws-region:
+        required: false
+        type: string
+        default: 'us-east-1'
+    secrets:
+      AWS_GITHUB_ACTIONS_ROLE_ARN:
+        required: true
+
+jobs:
+  cleanup:
+    name: Remove Preview Environment
+    runs-on: ubuntu-latest
+    env:
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Validate PR context
+        run: |
+          [ -n "$PR" ] || { echo "::error::not a pull_request event — no PR number"; exit 1; }
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Delete preview Lambda
+        if: inputs.name-prefix != ''
+        run: |
+          set -euo pipefail
+          FN="${{ inputs.name-prefix }}-preview-pr-$PR"
+          if aws lambda get-function --function-name "$FN" >/dev/null 2>&1; then
+            aws lambda delete-function-url-config --function-name "$FN" 2>/dev/null || true
+            aws lambda delete-function --function-name "$FN"
+            echo "Deleted $FN"
+          else
+            echo "$FN not found; nothing to delete"
+          fi
+
+      - name: Delete preview image tag
+        if: inputs.ecr-repository != ''
+        run: |
+          aws ecr batch-delete-image \
+            --repository-name "${{ inputs.ecr-repository }}" \
+            --image-ids imageTag="preview-pr-$PR" >/dev/null || true
+
+      - name: Delete preview S3 prefix
+        run: |
+          aws s3 rm "s3://${{ inputs.preview-bucket }}/previews/pr-$PR/" --recursive
+
+      - name: Invalidate preview prefix
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ inputs.distribution-id }}" \
+            --paths "/previews/pr-$PR/*" >/dev/null

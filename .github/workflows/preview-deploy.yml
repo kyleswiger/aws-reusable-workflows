@@ -1,0 +1,470 @@
+# Deploy a real per-PR preview environment onto the preview-substrate
+# (see aws-deployment-tooling/terraform-modules/preview-substrate):
+#
+#   backend  — per-PR Lambda <name-prefix>-preview-pr-<N> + public Function URL
+#   frontend — built with that Function URL baked in, synced to
+#              s3://<preview-bucket>/previews/pr-<N>/, served at
+#              https://pr-<N>.<preview-domain>
+#   e2e      — optional Playwright run against the live preview URL
+#
+# Caller requirements:
+#   permissions: { id-token: write, contents: read, pull-requests: write }
+#   concurrency: preview-${{ github.event.pull_request.number }} (recommended)
+#   trigger: pull_request [opened, synchronize, reopened]
+name: Preview Deploy
+
+on:
+  workflow_call:
+    inputs:
+      preview-domain:
+        description: "Parent preview domain (e.g. preview.example.com); PR N serves at https://pr-N.<preview-domain>"
+        required: true
+        type: string
+      preview-bucket:
+        description: "Preview S3 bucket (preview-substrate output preview_bucket)"
+        required: true
+        type: string
+      distribution-id:
+        description: "Preview CloudFront distribution ID (for invalidations)"
+        required: true
+        type: string
+      backend:
+        description: "Backend kind: zip | container | none"
+        required: false
+        type: string
+        default: 'none'
+      name-prefix:
+        description: "Site name prefix; the preview Lambda is <name-prefix>-preview-pr-<N>. Required unless backend=none"
+        required: false
+        type: string
+        default: ''
+      preview-exec-role-arn:
+        description: "Shared preview Lambda execution role ARN (preview-substrate output). Required unless backend=none"
+        required: false
+        type: string
+        default: ''
+      backend-build-command:
+        description: "Command that produces the backend artifact (zip mode: the zip at backend-zip-path)"
+        required: false
+        type: string
+        default: ''
+      backend-zip-path:
+        description: "Path to the built Lambda zip (zip mode)"
+        required: false
+        type: string
+        default: ''
+      lambda-handler:
+        description: "Lambda handler (zip mode)"
+        required: false
+        type: string
+        default: ''
+      lambda-runtime:
+        description: "Lambda runtime (zip mode)"
+        required: false
+        type: string
+        default: 'python3.12'
+      lambda-memory:
+        description: "Lambda memory (MB)"
+        required: false
+        type: string
+        default: '512'
+      lambda-timeout:
+        description: "Lambda timeout (seconds)"
+        required: false
+        type: string
+        default: '30'
+      lambda-environment:
+        description: >-
+          JSON object of environment variables for the preview Lambda (dev data
+          tier, dev auth mode, etc). PREVIEW_ORIGIN is merged in automatically
+          so the app can allow the preview URL in CORS.
+        required: false
+        type: string
+        default: '{}'
+      lambda-environment-ssm-path:
+        description: >-
+          SSM parameter holding a JSON object of environment variables for the
+          preview Lambda — lets Terraform own a large env instead of inlining
+          it in workflow YAML. Merged under lambda-environment (inline wins);
+          the CI role needs ssm:GetParameter on this path.
+        required: false
+        type: string
+        default: ''
+      ecr-repository:
+        description: "ECR repository name for the preview image (container mode); pushed as :preview-pr-<N>"
+        required: false
+        type: string
+        default: ''
+      container-dockerfile:
+        description: "Dockerfile path (container mode)"
+        required: false
+        type: string
+        default: 'Dockerfile'
+      container-context:
+        description: "Docker build context (container mode)"
+        required: false
+        type: string
+        default: '.'
+      lambda-architecture:
+        description: "Lambda architecture: x86_64 | arm64 (container images must match)"
+        required: false
+        type: string
+        default: 'x86_64'
+      static-api-url:
+        description: "API URL baked into the UI when backend=none"
+        required: false
+        type: string
+        default: ''
+      ui-dir:
+        description: "Frontend directory"
+        required: false
+        type: string
+        default: 'frontend'
+      ui-build-command:
+        description: "Frontend build command (run in ui-dir)"
+        required: false
+        type: string
+        default: 'npm run build'
+      ui-dist:
+        description: "Built frontend output dir (default <ui-dir>/dist)"
+        required: false
+        type: string
+        default: ''
+      api-url-env-name:
+        description: "Env var name the UI build reads the API URL from"
+        required: false
+        type: string
+        default: 'VITE_API_BASE_URL'
+      ui-env:
+        description: "Extra KEY=VALUE lines exported for the UI build"
+        required: false
+        type: string
+        default: ''
+      playwright-spec:
+        description: "Playwright spec/args run against the live preview URL after deploy; empty skips e2e"
+        required: false
+        type: string
+        default: ''
+      e2e-env:
+        description: "Extra KEY=VALUE lines exported for the Playwright run"
+        required: false
+        type: string
+        default: ''
+      node-version:
+        required: false
+        type: string
+        default: '20'
+      python-version:
+        required: false
+        type: string
+        default: '3.12'
+      aws-region:
+        required: false
+        type: string
+        default: 'us-east-1'
+    secrets:
+      AWS_GITHUB_ACTIONS_ROLE_ARN:
+        required: true
+    outputs:
+      preview-url:
+        description: "The deployed preview URL"
+        value: ${{ jobs.frontend.outputs.preview-url }}
+      api-url:
+        description: "The per-PR backend Function URL (empty when backend=none)"
+        value: ${{ jobs.backend.outputs.api-url }}
+
+jobs:
+  backend:
+    name: Deploy Preview Backend
+    if: inputs.backend != 'none'
+    runs-on: ubuntu-latest
+    outputs:
+      api-url: ${{ steps.lambda.outputs.api-url }}
+    env:
+      FUNCTION_NAME: ${{ inputs.name-prefix }}-preview-pr-${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [ -n "${{ github.event.pull_request.number }}" ] || fail "not a pull_request event — no PR number"
+          [ -n "${{ inputs.name-prefix }}" ] || fail "name-prefix is required when backend != none"
+          [ -n "${{ inputs.preview-exec-role-arn }}" ] || fail "preview-exec-role-arn is required when backend != none"
+          if [ "${{ inputs.backend }}" = "zip" ]; then
+            [ -n "${{ inputs.backend-build-command }}" ] || fail "backend-build-command is required for zip backends"
+            [ -n "${{ inputs.backend-zip-path }}" ] || fail "backend-zip-path is required for zip backends"
+            [ -n "${{ inputs.lambda-handler }}" ] || fail "lambda-handler is required for zip backends"
+          elif [ "${{ inputs.backend }}" = "container" ]; then
+            [ -n "${{ inputs.ecr-repository }}" ] || fail "ecr-repository is required for container backends"
+          else
+            fail "backend must be zip, container, or none (got '${{ inputs.backend }}')"
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Build backend zip
+        if: inputs.backend == 'zip'
+        run: ${{ inputs.backend-build-command }}
+
+      - name: Set up Docker Buildx
+        if: inputs.backend == 'container'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ECR
+        if: inputs.backend == 'container'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve preview image tag
+        if: inputs.backend == 'container'
+        id: image
+        run: echo "image=${{ steps.ecr.outputs.registry }}/${{ inputs.ecr-repository }}:preview-pr-${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push preview image
+        if: inputs.backend == 'container'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.container-context }}
+          file: ${{ inputs.container-dockerfile }}
+          push: true
+          platforms: ${{ inputs.lambda-architecture == 'arm64' && 'linux/arm64' || 'linux/amd64' }}
+          tags: ${{ steps.image.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Create or update preview Lambda
+        id: lambda
+        env:
+          LAMBDA_ENVIRONMENT: ${{ inputs.lambda-environment }}
+          PREVIEW_ORIGIN: https://pr-${{ github.event.pull_request.number }}.${{ inputs.preview-domain }}
+        run: |
+          set -euo pipefail
+          FN="$FUNCTION_NAME"
+          SSM_ENV='{}'
+          if [ -n "${{ inputs.lambda-environment-ssm-path }}" ]; then
+            SSM_ENV=$(aws ssm get-parameter --name "${{ inputs.lambda-environment-ssm-path }}" \
+              --with-decryption --query Parameter.Value --output text)
+          fi
+          ENV_JSON=$(jq -nc --argjson ssm "$SSM_ENV" --argjson base "$LAMBDA_ENVIRONMENT" --arg origin "$PREVIEW_ORIGIN" \
+            '{Variables: ($ssm + $base + {PREVIEW_ORIGIN: $origin})}')
+
+          if aws lambda get-function --function-name "$FN" >/dev/null 2>&1; then
+            echo "Updating existing $FN"
+            if [ "${{ inputs.backend }}" = "zip" ]; then
+              aws lambda update-function-code --function-name "$FN" \
+                --zip-file "fileb://${{ inputs.backend-zip-path }}" >/dev/null
+            else
+              aws lambda update-function-code --function-name "$FN" \
+                --image-uri "${{ steps.image.outputs.image }}" >/dev/null
+            fi
+            aws lambda wait function-updated --function-name "$FN"
+            CONFIG_ARGS=(--function-name "$FN"
+              --environment "$ENV_JSON"
+              --memory-size "${{ inputs.lambda-memory }}"
+              --timeout "${{ inputs.lambda-timeout }}")
+            if [ "${{ inputs.backend }}" = "zip" ]; then
+              CONFIG_ARGS+=(--handler "${{ inputs.lambda-handler }}" --runtime "${{ inputs.lambda-runtime }}")
+            fi
+            aws lambda update-function-configuration "${CONFIG_ARGS[@]}" >/dev/null
+            aws lambda wait function-updated --function-name "$FN"
+          else
+            echo "Creating $FN"
+            CREATE_ARGS=(--function-name "$FN"
+              --role "${{ inputs.preview-exec-role-arn }}"
+              --architectures "${{ inputs.lambda-architecture }}"
+              --environment "$ENV_JSON"
+              --memory-size "${{ inputs.lambda-memory }}"
+              --timeout "${{ inputs.lambda-timeout }}"
+              --tags "preview=pr-${{ github.event.pull_request.number }},repo=${{ github.repository }}")
+            if [ "${{ inputs.backend }}" = "zip" ]; then
+              CREATE_ARGS+=(--zip-file "fileb://${{ inputs.backend-zip-path }}"
+                --handler "${{ inputs.lambda-handler }}"
+                --runtime "${{ inputs.lambda-runtime }}")
+            else
+              CREATE_ARGS+=(--package-type Image
+                --code "ImageUri=${{ steps.image.outputs.image }}")
+            fi
+            aws lambda create-function "${CREATE_ARGS[@]}" >/dev/null
+            aws lambda wait function-active --function-name "$FN"
+          fi
+
+          if ! aws lambda get-function-url-config --function-name "$FN" >/dev/null 2>&1; then
+            aws lambda create-function-url-config --function-name "$FN" --auth-type NONE >/dev/null
+          fi
+          # Ensure the public-invoke permission exists even if an earlier run
+          # created the URL config but died before adding it. Tolerate only
+          # "already exists" conflicts; surface real failures (e.g. IAM denies).
+          if ! PERM_OUT=$(aws lambda add-permission --function-name "$FN" \
+              --statement-id FunctionURLAllowPublicAccess \
+              --action lambda:InvokeFunctionUrl \
+              --principal '*' \
+              --function-url-auth-type NONE 2>&1); then
+            echo "$PERM_OUT" | grep -q ResourceConflictException || { echo "$PERM_OUT" >&2; exit 1; }
+          fi
+          URL=$(aws lambda get-function-url-config --function-name "$FN" --query FunctionUrl --output text)
+          URL="${URL%/}"
+          echo "api-url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Preview backend: $URL"
+
+  frontend:
+    name: Deploy Preview Frontend
+    needs: backend
+    # Run whether the backend job ran or was skipped (backend=none), but not if it failed.
+    if: always() && (needs.backend.result == 'success' || needs.backend.result == 'skipped')
+    runs-on: ubuntu-latest
+    outputs:
+      preview-url: ${{ steps.meta.outputs.preview-url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve preview metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          PR="${{ github.event.pull_request.number }}"
+          [ -n "$PR" ] || { echo "::error::not a pull_request event — no PR number"; exit 1; }
+          API_URL="${{ needs.backend.outputs.api-url }}"
+          if [ "${{ inputs.backend }}" = "none" ]; then
+            API_URL="${{ inputs.static-api-url }}"
+          fi
+          DIST="${{ inputs.ui-dist }}"
+          [ -n "$DIST" ] || DIST="${{ inputs.ui-dir }}/dist"
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          echo "preview-url=https://pr-$PR.${{ inputs.preview-domain }}" >> "$GITHUB_OUTPUT"
+          echo "api-url=$API_URL" >> "$GITHUB_OUTPUT"
+          echo "dist=$DIST" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: '${{ inputs.ui-dir }}/package-lock.json'
+
+      - name: Install UI dependencies
+        working-directory: ${{ inputs.ui-dir }}
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Build UI for preview
+        working-directory: ${{ inputs.ui-dir }}
+        env:
+          UI_ENV: ${{ inputs.ui-env }}
+        run: |
+          set -euo pipefail
+          if [ -n "$UI_ENV" ]; then
+            while IFS= read -r line; do
+              case "$line" in ''|'#'*) continue ;; esac
+              export "${line?}"
+            done <<< "$UI_ENV"
+          fi
+          export "${{ inputs.api-url-env-name }}=${{ steps.meta.outputs.api-url }}"
+          ${{ inputs.ui-build-command }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Sync UI to preview prefix
+        run: |
+          set -euo pipefail
+          DEST="s3://${{ inputs.preview-bucket }}/previews/pr-${{ steps.meta.outputs.pr }}"
+          aws s3 sync "${{ steps.meta.outputs.dist }}" "$DEST" --delete \
+            --exclude index.html \
+            --cache-control "public,max-age=31536000,immutable"
+          aws s3 cp "${{ steps.meta.outputs.dist }}/index.html" "$DEST/index.html" \
+            --cache-control "public,max-age=0,must-revalidate" \
+            --content-type "text/html; charset=utf-8"
+
+      - name: Invalidate preview prefix
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ inputs.distribution-id }}" \
+            --paths "/previews/pr-${{ steps.meta.outputs.pr }}/*" >/dev/null
+
+      - name: Comment PR
+        uses: mshick/add-pr-comment@v2
+        with:
+          message: |
+            🚀 **Preview environment ready:** ${{ steps.meta.outputs.preview-url }}
+
+            | | |
+            |---|---|
+            | Frontend | ${{ steps.meta.outputs.preview-url }} |
+            | Backend | ${{ steps.meta.outputs.api-url || 'none' }} |
+            | Commit | ${{ github.event.pull_request.head.sha }} |
+
+            Rebuilt on every push; removed when the PR closes.
+
+  e2e:
+    name: E2E (live preview)
+    needs: [backend, frontend]
+    if: always() && needs.frontend.result == 'success' && inputs.playwright-spec != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: '${{ inputs.ui-dir }}/package-lock.json'
+
+      - name: Install UI dependencies
+        working-directory: ${{ inputs.ui-dir }}
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles(format('{0}/package-lock.json', inputs.ui-dir)) }}
+          restore-keys: pw-${{ runner.os }}-
+
+      - name: Install Playwright
+        working-directory: ${{ inputs.ui-dir }}
+        run: |
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" = "true" ]; then
+            npx playwright install-deps chromium
+          else
+            npx playwright install --with-deps chromium
+          fi
+
+      - name: Wait for preview to serve
+        run: |
+          timeout 120 bash -c 'until curl -sf "${{ needs.frontend.outputs.preview-url }}" >/dev/null; do sleep 3; done'
+
+      - name: Run Playwright against live preview
+        working-directory: ${{ inputs.ui-dir }}
+        env:
+          PLAYWRIGHT_BASE_URL: ${{ needs.frontend.outputs.preview-url }}
+          PREVIEW_API_URL: ${{ needs.backend.outputs.api-url }}
+          E2E_ENV: ${{ inputs.e2e-env }}
+        run: |
+          set -euo pipefail
+          if [ -n "$E2E_ENV" ]; then
+            while IFS= read -r line; do
+              case "$line" in ''|'#'*) continue ;; esac
+              export "${line?}"
+            done <<< "$E2E_ENV"
+          fi
+          npx playwright test ${{ inputs.playwright-spec }}
