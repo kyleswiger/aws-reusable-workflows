@@ -20,6 +20,9 @@ jobs:
       # Consumers pin `@v1` to track the latest release without manual bumps.
       - uses: actions/checkout@v4
         if: ${{ steps.rp.outputs.release_created }}
+        with:
+          # The tag release-please just cut is not in a default shallow clone.
+          fetch-depth: 0
       - name: Update floating major tag
         if: ${{ steps.rp.outputs.release_created }}
         run: |
