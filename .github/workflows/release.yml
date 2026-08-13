@@ -1,0 +1,29 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: rp
+        with:
+          release-type: simple
+
+      # Consumers pin `@v1` to track the latest release without manual bumps.
+      - uses: actions/checkout@v4
+        if: ${{ steps.rp.outputs.release_created }}
+      - name: Update floating major tag
+        if: ${{ steps.rp.outputs.release_created }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f "v${{ steps.rp.outputs.major }}" "${{ steps.rp.outputs.tag_name }}"
+          git push -f origin "v${{ steps.rp.outputs.major }}"
