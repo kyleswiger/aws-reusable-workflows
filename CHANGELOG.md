@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/kyleswiger/aws-reusable-workflows/compare/v1.0.0...v1.0.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* fetch tags before updating floating major tag ([#5](https://github.com/kyleswiger/aws-reusable-workflows/issues/5)) ([74480d3](https://github.com/kyleswiger/aws-reusable-workflows/commit/74480d3292540ba8dea7159f242a7ed1b0b13b17))
+
 ## 1.0.0 (2026-08-13)
 
 
