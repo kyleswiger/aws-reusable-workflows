@@ -1,8 +1,13 @@
 # aws-reusable-workflows
 
 Reusable (`workflow_call`) GitHub Actions workflows shared across Kyle's
-sites. AWS access is OIDC-only (`aws-actions/configure-aws-credentials`), never
-long-lived keys.
+sites and paired projects. AWS access is OIDC-only
+(`aws-actions/configure-aws-credentials`), never long-lived keys. Non-AWS
+targets (fly.io) get the smallest scoped token that works, held in a GitHub
+environment — see [`docs/fly-and-cloudflare.md`](docs/fly-and-cloudflare.md).
+
+Pin by release tag (`@v1.1.0`) for workflows that take no secrets; pin by full
+commit SHA for any workflow you hand a deploy token to.
 
 ## Preview environments
 
@@ -95,6 +100,29 @@ jobs:
       distribution-id: E2ABCDEF123456
       name-prefix: myapp
 ```
+
+## Elixir / BEAM, fly.io and ECS
+
+Language- and target-agnostic building blocks, added for Elixir projects that
+deploy to fly.io or ECS Fargate. Details in [`docs/elixir-ci.md`](docs/elixir-ci.md),
+[`docs/fly-and-cloudflare.md`](docs/fly-and-cloudflare.md) and
+[`docs/ecs-fargate.md`](docs/ecs-fargate.md); copy-in callers under
+[`templates/callers/`](templates/callers/).
+
+| Workflow / action | Purpose | Secrets |
+|---|---|---|
+| `elixir-ci.yml` | format, compile -Werror, deps checks + audits, credo, sobelow, xref cycles, test (optional Postgres), dialyzer — one job each, so each can be a required check. | none |
+| `oci-build-push.yml` | Build an image once → GHCR (or ECR via OIDC), BuildKit cache, SLSA provenance. Outputs the immutable `image-ref` for deploy jobs. | none for GHCR |
+| `fly-deploy.yml` | `fly deploy --image` (or remote build) under a required GitHub `environment`; health probe; prints the running image for rollback. **Pin by full SHA.** | `FLY_API_TOKEN` (app-scoped deploy token, per environment) |
+| `ecs-deploy.yml` | Register a new task-definition revision with only the image changed and `update-service` on an existing Fargate service (Terraform owns the shape); optional pre-deploy migration task; circuit-breaker-aware rollout wait; prints the rollback command. Requires a GitHub `environment`. | `AWS_GITHUB_ACTIONS_ROLE_ARN` (OIDC, per environment) |
+| `otp-release.yml` | `mix release` per named release on a `v*` tag, boot check in a clean container, CycloneDX SBOM, provenance, attach to a **draft** GitHub Release. | none |
+| `actions/setup-beam-cached` | erlef/setup-beam from `.tool-versions` + deps/_build cache + optional PLT restore. Used by the workflows above; usable from a consumer's own jobs. | — |
+
+Templates: `templates/docker/phoenix.Dockerfile`, `templates/fly/fly.phoenix.toml`,
+`templates/github/dependabot.mix.yml`. `scripts/ruleset-add-required-check.sh`
+appends required checks to an **existing** ruleset by name instead of
+replacing it (use this, not `apply-branch-ruleset.sh`, on a repo that already
+has its own ruleset).
 
 ## Other workflows
 

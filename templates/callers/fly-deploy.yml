@@ -1,0 +1,51 @@
+# .github/workflows/deploy.yml in the consuming repo.
+# Build once → staging → (reviewer gate) → prod, same image digest throughout.
+name: Deploy
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  image:
+    uses: kyleswiger/aws-reusable-workflows/.github/workflows/oci-build-push.yml@v1.1.0
+    with:
+      image: ${{ github.repository }}
+      dockerfile: Dockerfile
+
+  staging:
+    needs: image
+    # Full-SHA pin: this workflow receives the deploy token. Dependabot's
+    # github-actions ecosystem keeps the SHA current.
+    uses: kyleswiger/aws-reusable-workflows/.github/workflows/fly-deploy.yml@0000000000000000000000000000000000000000 # v1.1.0
+    with:
+      app: my-app-staging
+      environment: staging
+      config: fly.staging.toml
+      image: ${{ needs.image.outputs.image-ref }}
+      ghcr-login: true
+      health-url: https://my-app-staging.fly.dev/healthz
+    secrets:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  production:
+    needs: [image, staging]
+    uses: kyleswiger/aws-reusable-workflows/.github/workflows/fly-deploy.yml@0000000000000000000000000000000000000000 # v1.1.0
+    with:
+      app: my-app-prod
+      environment: production      # required reviewer configured on the environment
+      config: fly.prod.toml
+      image: ${{ needs.image.outputs.image-ref }}
+      ghcr-login: true
+      health-url: https://example.com/healthz
+    secrets:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

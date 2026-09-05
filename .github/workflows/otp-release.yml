@@ -1,0 +1,212 @@
+# Build `mix release` artifacts for one or more named releases, prove each
+# one boots in a clean container, attach a CycloneDX SBOM and a SLSA
+# provenance attestation, and (on a tag) upload everything to a DRAFT GitHub
+# Release for a human to publish.
+#
+# Draft by design: the owner reads the notes and publishes; CI never
+# publishes on inference. Pair with a signed annotated tag pushed by the
+# owner — no release-please, no bot commits, so a repo with a commit
+# attestation gate (HackTUI) keeps it intact.
+#
+# Portability: a release built on the runner runs only on the same libc /
+# OpenSSL generation, so the smoke container defaults to the runner's own
+# OS image. For a distributable artifact build in Docker with a pinned base
+# (templates/docker/phoenix.Dockerfile) and use oci-build-push.yml instead.
+#
+# Caller requirements:
+#   permissions: { contents: write, id-token: write, attestations: write }
+#   trigger: push tags v* (and optionally workflow_dispatch for dry runs)
+name: OTP Release
+
+on:
+  workflow_call:
+    inputs:
+      releases:
+        description: "Comma-separated release names from mix.exs releases: (empty = the default release)"
+        required: false
+        type: string
+        default: ""
+      working-directory:
+        required: false
+        type: string
+        default: "."
+      version-file:
+        required: false
+        type: string
+        default: ".tool-versions"
+      otp-version:
+        required: false
+        type: string
+        default: ""
+      elixir-version:
+        required: false
+        type: string
+        default: ""
+      mix-env:
+        required: false
+        type: string
+        default: "prod"
+      build-command:
+        description: "Command run before mix release (assets, etc.); empty skips"
+        required: false
+        type: string
+        default: ""
+      smoke-command:
+        description: >-
+          Command run inside a clean container with the extracted release at
+          /rel (e.g. `/rel/bin/my_app eval 'IO.puts(:ok)'`). $RELEASE holds
+          the release name. Empty skips the boot check.
+        required: false
+        type: string
+        default: ""
+      smoke-image:
+        description: "Container image for the boot check; must match the runner's OS generation"
+        required: false
+        type: string
+        default: "ubuntu:24.04"
+      smoke-env:
+        description: "KEY=VALUE lines passed into the smoke container"
+        required: false
+        type: string
+        default: ""
+      sbom:
+        description: "Generate a CycloneDX SBOM with erlef's sbom mix archive"
+        required: false
+        type: boolean
+        default: true
+      provenance:
+        description: "Attest build provenance for every artifact"
+        required: false
+        type: boolean
+        default: true
+      upload-to-release:
+        description: "On a tag ref, attach artifacts to a draft GitHub Release (created if missing)"
+        required: false
+        type: boolean
+        default: true
+      artifact-retention-days:
+        required: false
+        type: number
+        default: 30
+      runner:
+        required: false
+        type: string
+        default: "ubuntu-24.04"
+    outputs:
+      version:
+        description: "Version read from mix.exs"
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  build:
+    name: release
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    env:
+      MIX_ENV: ${{ inputs.mix-env }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kyleswiger/aws-reusable-workflows
+          ref: ${{ job.workflow_sha }}
+          path: .tooling
+      - id: beam
+        uses: ./.tooling/.github/actions/setup-beam-cached
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          version-file: ${{ inputs.version-file }}
+          otp-version: ${{ inputs.otp-version }}
+          elixir-version: ${{ inputs.elixir-version }}
+          cache-prefix: mix-${{ inputs.mix-env }}
+
+      - name: Version from mix.exs
+        id: version
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          v=$(mix run --no-start --no-compile --no-deps-check -e 'IO.puts(Mix.Project.config()[:version])' 2>/dev/null | tail -1)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "mix.exs version: $v" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${{ github.ref_name }}" != "v$v" ]; then
+            echo "::warning::tag ${{ github.ref_name }} does not match mix.exs version $v"
+          fi
+
+      - name: Pre-build
+        if: inputs.build-command != ''
+        run: ${{ inputs.build-command }}
+        working-directory: ${{ inputs.working-directory }}
+
+      - name: mix release
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          mkdir -p dist
+          arch=$(uname -m)
+          IFS=',' read -ra names <<< "${{ inputs.releases }}"
+          [ ${#names[@]} -eq 0 ] && names=("")
+          for name in "${names[@]}"; do
+            name=$(echo "$name" | xargs)
+            if [ -n "$name" ]; then
+              mix release "$name" --overwrite
+            else
+              mix release --overwrite
+              name=$(ls _build/${{ inputs.mix-env }}/rel | head -1)
+            fi
+            tar -C "_build/${{ inputs.mix-env }}/rel/$name" -czf \
+              "dist/${name}-${{ steps.version.outputs.version }}-linux-${arch}.tar.gz" .
+            echo "$name" >> dist/.releases
+          done
+          ls -la dist
+
+      - name: Boot check in a clean container
+        if: inputs.smoke-command != ''
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          envfile=$(mktemp)
+          printf '%s\n' "${{ inputs.smoke-env }}" | grep -Ev '^\s*(#|$)' > "$envfile" || true
+          status=0
+          while read -r name; do
+            tarball=$(ls dist/"${name}"-*-linux-*.tar.gz)
+            echo "== $name ($tarball)"
+            docker run --rm -v "$PWD/$tarball:/release.tar.gz:ro" --env-file "$envfile" \
+              -e RELEASE="$name" "${{ inputs.smoke-image }}" bash -ec '
+                mkdir -p /rel && tar -C /rel -xzf /release.tar.gz
+                ${{ inputs.smoke-command }}' || { echo "::error::$name failed the boot check"; status=1; }
+          done < dist/.releases
+          exit $status
+
+      - name: SBOM (CycloneDX)
+        if: inputs.sbom
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          mix archive.install hex sbom --force
+          mix sbom.cyclonedx -o "dist/sbom-${{ steps.version.outputs.version }}.cyclonedx.json" --format json -f
+
+      - name: Attest build provenance
+        if: inputs.provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ inputs.working-directory }}/dist/*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.version.outputs.version }}
+          path: |
+            ${{ inputs.working-directory }}/dist/*.tar.gz
+            ${{ inputs.working-directory }}/dist/*.json
+          retention-days: ${{ inputs.artifact-retention-days }}
+          if-no-files-found: error
+
+      - name: Attach to draft GitHub Release
+        if: inputs.upload-to-release && github.ref_type == 'tag'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag --generate-notes --title "$TAG"
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.json --clobber
+          echo "Artifacts attached to draft release $TAG — publish it by hand." >> "$GITHUB_STEP_SUMMARY"

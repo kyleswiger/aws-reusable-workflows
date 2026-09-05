@@ -1,0 +1,23 @@
+# .github/dependabot.yml for an Elixir repo.
+# Hex has no security-advisory feed for Dependabot: this is version drift
+# only. CVEs come from `mix deps.audit` in elixir-ci.yml.
+version: 2
+updates:
+  - package-ecosystem: mix
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      hex:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(ci)"
