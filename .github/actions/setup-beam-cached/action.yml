@@ -1,0 +1,121 @@
+# Elixir/OTP toolchain + dependency cache, factored out so every job in
+# elixir-ci.yml (and any consumer's own jobs) sets up the BEAM identically.
+#
+#   - versions come from the repo's .tool-versions (asdf/mise format) unless
+#     otp-version/elixir-version are given explicitly. Reading the file means
+#     the version is declared in ONE place; hard-coding it in the workflow,
+#     the deps cache key and the PLT cache key (three places) is how a bump
+#     silently misses one of them.
+#   - deps + _build are cached on OS + OTP + Elixir + mix.lock.
+#   - the dialyzer PLT is only *restored* here (plt: "true"). Saving is the
+#     caller's job with actions/cache/save, so the PLT is persisted even when
+#     `mix dialyzer` itself fails — see elixir-ci.yml's dialyzer job.
+#
+# No checkout: `uses: ./.github/actions/...` only resolves after the calling
+# job has checked out, and a second checkout would re-shallow the tree.
+name: Setup BEAM (cached)
+description: erlef/setup-beam from .tool-versions plus deps/_build cache and optional PLT restore.
+
+inputs:
+  version-file:
+    description: "asdf/mise version file to read otp + elixir from"
+    required: false
+    default: ".tool-versions"
+  otp-version:
+    description: "Explicit OTP version; overrides version-file when set"
+    required: false
+    default: ""
+  elixir-version:
+    description: "Explicit Elixir version; overrides version-file when set"
+    required: false
+    default: ""
+  working-directory:
+    description: "Directory containing mix.exs"
+    required: false
+    default: "."
+  deps-get:
+    description: "Run `mix deps.get --check-locked` after restoring the cache"
+    required: false
+    default: "true"
+  plt:
+    description: "Also restore the dialyzer PLT cache (priv/plts)"
+    required: false
+    default: "false"
+  plt-path:
+    description: "PLT directory (must match dialyzer: plt_core_path/plt_local_path in mix.exs)"
+    required: false
+    default: "priv/plts"
+  cache-prefix:
+    description: "Extra cache-key discriminator (e.g. the MIX_ENV) when one repo caches several builds"
+    required: false
+    default: "mix"
+
+outputs:
+  otp-version:
+    description: "Resolved OTP version"
+    value: ${{ steps.versions.outputs.otp }}
+  elixir-version:
+    description: "Resolved Elixir version"
+    value: ${{ steps.versions.outputs.elixir }}
+  plt-cache-hit:
+    description: "'true' when the PLT primary key hit (plt: true only)"
+    value: ${{ steps.plt.outputs.cache-hit }}
+  plt-cache-key:
+    description: "Primary PLT cache key to pass to actions/cache/save (plt: true only)"
+    value: ${{ steps.plt.outputs.cache-primary-key }}
+
+runs:
+  using: composite
+  steps:
+    - name: Setup BEAM (from version file)
+      if: inputs.otp-version == '' && inputs.elixir-version == ''
+      id: beam-file
+      uses: erlef/setup-beam@v1
+      with:
+        version-file: ${{ inputs.working-directory }}/${{ inputs.version-file }}
+        # setup-beam refuses version-file without strict; the file pins exact versions anyway.
+        version-type: strict
+
+    - name: Setup BEAM (explicit versions)
+      if: inputs.otp-version != '' || inputs.elixir-version != ''
+      id: beam-explicit
+      uses: erlef/setup-beam@v1
+      with:
+        otp-version: ${{ inputs.otp-version }}
+        elixir-version: ${{ inputs.elixir-version }}
+
+    - name: Resolve versions
+      id: versions
+      shell: bash
+      run: |
+        otp="${{ steps.beam-file.outputs.otp-version || steps.beam-explicit.outputs.otp-version }}"
+        ex="${{ steps.beam-file.outputs.elixir-version || steps.beam-explicit.outputs.elixir-version }}"
+        echo "otp=$otp" >> "$GITHUB_OUTPUT"
+        echo "elixir=$ex" >> "$GITHUB_OUTPUT"
+        echo "OTP $otp / Elixir $ex" >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Cache deps and _build
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ inputs.working-directory }}/deps
+          ${{ inputs.working-directory }}/_build
+        key: ${{ inputs.cache-prefix }}-${{ runner.os }}-otp${{ steps.versions.outputs.otp }}-ex${{ steps.versions.outputs.elixir }}-${{ hashFiles(format('{0}/**/mix.lock', inputs.working-directory)) }}
+        restore-keys: |
+          ${{ inputs.cache-prefix }}-${{ runner.os }}-otp${{ steps.versions.outputs.otp }}-ex${{ steps.versions.outputs.elixir }}-
+
+    - name: Restore dialyzer PLT
+      if: inputs.plt == 'true'
+      id: plt
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ inputs.working-directory }}/${{ inputs.plt-path }}
+        key: plt-${{ runner.os }}-otp${{ steps.versions.outputs.otp }}-ex${{ steps.versions.outputs.elixir }}-${{ hashFiles(format('{0}/**/mix.lock', inputs.working-directory)) }}
+        restore-keys: |
+          plt-${{ runner.os }}-otp${{ steps.versions.outputs.otp }}-ex${{ steps.versions.outputs.elixir }}-
+
+    - name: mix deps.get --check-locked
+      if: inputs.deps-get == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: mix deps.get --check-locked

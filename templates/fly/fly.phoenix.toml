@@ -1,0 +1,46 @@
+# One file per environment (fly.staging.toml / fly.prod.toml) with the app
+# name and PHX_HOST changed; everything else identical.
+app = "my-app-prod"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+
+[build]
+  # Ignored when deploying with --image; kept for `fly deploy` from source.
+  [build.args]
+    MIX_ENV = "prod"
+
+[deploy]
+  # Runs against the NEW image in a throwaway machine before any running
+  # machine is replaced. Migrations must stay compatible with the old code.
+  release_command = "/app/bin/migrate"
+  # bluegreen needs working checks and no attached volumes; use "rolling" otherwise.
+  strategy = "bluegreen"
+
+[env]
+  PHX_HOST = "example.com"
+  PORT = "8080"
+  ECTO_IPV6 = "true"
+  # Phoenix's default dns_cluster strategy; the app's own 6PN name.
+  DNS_CLUSTER_QUERY = "my-app-prod.internal"
+  ERL_AFLAGS = "-proto_dist inet6_tcp"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  # 1 for production so LiveView is never cold-starting; 0 for staging.
+  min_machines_running = 1
+  processes = ["app"]
+
+  [[http_service.checks]]
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/healthz"
+    headers = { X-Forwarded-Proto = "https" }
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
