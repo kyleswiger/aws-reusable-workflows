@@ -1,0 +1,186 @@
+# Deploy one Fly app from a prebuilt image (preferred) or from the repo's
+# Dockerfile on Fly's remote builder.
+#
+# Security model — read before wiring a caller:
+#   - Fly has no GitHub OIDC federation, so a stored token is unavoidable.
+#     Use an APP-SCOPED deploy token with an expiry, never `fly auth token`:
+#         fly tokens create deploy -a <app> -x 2160h    # 90 days
+#     and put it in a GitHub *environment* secret named FLY_API_TOKEN.
+#   - `environment` is a required input. The job runs under that GitHub
+#     environment, so the token it sees is the one scoped to that env, and
+#     the production environment can require a reviewer before the job
+#     starts. Staging creds can never reach a prod deploy by accident.
+#   - This workflow receives the token. Pin it by full commit SHA (or vendor
+#     it) — a tag-pinned deploy workflow trusts every future push to the
+#     source repo with your deploy token.
+#
+# Rollback: Fly has no `releases rollback`. Re-run the caller with `image`
+# set to a previous immutable ref (the step summary prints it every time) and
+# strategy=immediate.
+#
+# Caller requirements:
+#   permissions: { contents: read }  (+ packages: read to pull a private GHCR image)
+#   concurrency: deploy-<app> with cancel-in-progress: false
+name: Fly Deploy
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: "Fly app name"
+        required: true
+        type: string
+      environment:
+        description: "GitHub environment to run under (holds FLY_API_TOKEN, may require reviewers)"
+        required: true
+        type: string
+      config:
+        description: "fly.toml path; keep one per environment (fly.staging.toml, fly.prod.toml)"
+        required: false
+        type: string
+        default: "fly.toml"
+      image:
+        description: "Prebuilt image ref (registry/name@sha256:… or :tag). Empty builds from Dockerfile on Fly's remote builder"
+        required: false
+        type: string
+        default: ""
+      strategy:
+        description: "rolling | bluegreen | canary | immediate; empty uses the fly.toml [deploy] strategy"
+        required: false
+        type: string
+        default: ""
+      image-label:
+        description: "Label for the image in Fly's registry; shows in `fly releases`"
+        required: false
+        type: string
+        default: "${{ github.sha }}"
+      build-args:
+        description: "KEY=VALUE lines passed as --build-arg (remote-build mode only)"
+        required: false
+        type: string
+        default: ""
+      deploy-args:
+        description: "Extra arguments appended to fly deploy"
+        required: false
+        type: string
+        default: ""
+      wait-timeout:
+        required: false
+        type: string
+        default: "10m"
+      release-command-timeout:
+        required: false
+        type: string
+        default: "5m"
+      health-url:
+        description: "URL probed after the deploy until it returns 2xx/3xx; empty skips"
+        required: false
+        type: string
+        default: ""
+      health-attempts:
+        required: false
+        type: number
+        default: 20
+      ghcr-login:
+        description: "docker login ghcr.io with GITHUB_TOKEN first, so a private GHCR image can be pulled"
+        required: false
+        type: boolean
+        default: false
+      flyctl-version:
+        description: "flyctl version; 'latest' or an exact x.y.z"
+        required: false
+        type: string
+        default: "latest"
+      runner:
+        required: false
+        type: string
+        default: "ubuntu-24.04"
+    secrets:
+      FLY_API_TOKEN:
+        description: "App-scoped deploy token from `fly tokens create deploy -a <app>`"
+        required: true
+    outputs:
+      image:
+        description: "Image the app is now running, for rollback"
+        value: ${{ jobs.deploy.outputs.image }}
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: fly-deploy-${{ inputs.app }}
+      cancel-in-progress: false
+    outputs:
+      image: ${{ steps.result.outputs.image }}
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+        with:
+          version: ${{ inputs.flyctl-version }}
+
+      - name: Login to GHCR (pull)
+        if: inputs.ghcr-login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Token sanity
+        run: |
+          # A wrong-scope token fails here with a clear message instead of
+          # halfway through a deploy.
+          flyctl status --app "${{ inputs.app }}" --json > /dev/null
+
+      - name: fly deploy
+        run: |
+          args=(deploy --app "${{ inputs.app }}" --config "${{ inputs.config }}"
+                --wait-timeout "${{ inputs.wait-timeout }}"
+                --release-command-timeout "${{ inputs.release-command-timeout }}"
+                --image-label "${{ inputs.image-label }}" --yes)
+          if [ -n "${{ inputs.image }}" ]; then
+            args+=(--image "${{ inputs.image }}")
+          else
+            args+=(--remote-only)
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              args+=(--build-arg "$line")
+            done <<< "${{ inputs.build-args }}"
+          fi
+          [ -n "${{ inputs.strategy }}" ] && args+=(--strategy "${{ inputs.strategy }}")
+          # shellcheck disable=SC2206
+          args+=(${{ inputs.deploy-args }})
+          flyctl "${args[@]}"
+
+      - name: Health probe
+        if: inputs.health-url != ''
+        run: |
+          for i in $(seq 1 ${{ inputs.health-attempts }}); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${{ inputs.health-url }}" || echo 000)
+            case "$code" in 2*|3*) echo "healthy ($code) after $i attempt(s)"; exit 0;; esac
+            echo "attempt $i: $code"; sleep 6
+          done
+          echo "::error::${{ inputs.health-url }} never returned 2xx/3xx"; exit 1
+
+      - name: Record release
+        id: result
+        if: always()
+        run: |
+          set +e
+          cur=$(flyctl releases --app "${{ inputs.app }}" --image --json 2>/dev/null \
+                | jq -r '.[0].ImageRef // .[0].image_ref // empty' 2>/dev/null)
+          echo "image=$cur" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Fly: ${{ inputs.app }} (${{ inputs.environment }})"
+            echo; echo "Running image: \`${cur:-unknown}\`"
+            echo; echo "Recent releases:"; echo '```'
+            flyctl releases --app "${{ inputs.app }}" --image 2>/dev/null | head -6
+            echo '```'
+            echo "Rollback: re-run with \`image: <previous ref>\` and \`strategy: immediate\`."
+          } >> "$GITHUB_STEP_SUMMARY"
