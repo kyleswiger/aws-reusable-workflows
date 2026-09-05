@@ -1,0 +1,21 @@
+# Lint this repo's own workflows. actionlint catches expression typos,
+# unknown context properties and shell mistakes that otherwise only surface
+# when a consumer's run fails against a tagged release.
+name: lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: raven-actions/actionlint@v2
+      - name: Shell syntax
+        run: for f in scripts/*.sh; do bash -n "$f"; done

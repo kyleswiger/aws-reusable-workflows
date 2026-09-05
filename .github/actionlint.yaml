@@ -1,0 +1,7 @@
+# job.workflow_sha (the commit of the workflow file defining the current job,
+# i.e. this repo's pinned ref inside a reusable workflow) is documented by
+# GitHub but not yet in actionlint's context schema.
+paths:
+  .github/workflows/**/*.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined in object type'
