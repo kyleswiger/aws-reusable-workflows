@@ -242,6 +242,7 @@ jobs:
           echo "## deps.audit" >> "$GITHUB_STEP_SUMMARY"
           # deps.loadpaths first: in an umbrella mix_audit cannot load its own
           # yaml_elixir dependency otherwise and crashes instead of reporting.
+          # shellcheck disable=SC1010  # `do` is mix's task name, not a keyword
           mix do deps.loadpaths + deps.audit 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || fail=1
           if [ "$fail" -ne 0 ]; then
             if [ "${{ inputs.audit-blocking }}" = "true" ]; then
@@ -380,7 +381,11 @@ jobs:
             } >> "$GITHUB_ENV"
           fi
           # KEY=VALUE lines from the caller; blank lines and # comments ignored.
-          printf '%s\n' "${{ inputs.test-env }}" | grep -Ev '^\s*(#|$)' >> "$GITHUB_ENV" || true
+          # Quoted heredoc: the input is never re-parsed by the shell, so quotes
+          # or backslashes in a value cannot break out of the script.
+          grep -Ev '^\s*(#|$)' <<'CALLER_ENV' >> "$GITHUB_ENV" || true
+          ${{ inputs.test-env }}
+          CALLER_ENV
       - name: Test setup
         if: inputs.test-setup-command != ''
         run: ${{ inputs.test-setup-command }}
