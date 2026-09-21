@@ -1,0 +1,308 @@
+# Deploy a prebuilt image to an existing ECS Fargate service — the one the
+# `ecs-fargate-service` Terraform module (aws-deployment-tooling) created.
+#
+# Ownership model: Terraform owns the task-definition SHAPE (cpu/memory,
+# ports, env, secrets, logging, roles); this workflow owns only the image.
+# It reads the service's current task definition, registers a NEW REVISION
+# with just `containerDefinitions[<container-name>].image` replaced, and
+# points the service at it with `update-service`. Nothing here needs to
+# know what Terraform put in the definition, and Terraform must
+# `ignore_changes = [task_definition]` on the service so the next apply does
+# not roll the image back.
+#
+# Security model — read before wiring a caller:
+#   - AWS access is GitHub OIDC only (aws-actions/configure-aws-credentials
+#     with role-to-assume); there is no stored key.
+#   - `environment` is a required input. The job runs under that GitHub
+#     environment, so the role ARN it assumes is the one scoped to that env
+#     (a staging role cannot deploy prod), and the production environment
+#     can require a reviewer before the job starts.
+#   - The role needs: ecs:Describe*/RegisterTaskDefinition/UpdateService/
+#     RunTask, iam:PassRole on the task + execution roles, and
+#     logs:GetLogEvents on the awslogs group (pre-deploy task output).
+#
+# Rollback: every run prints the previous task-definition ARN and the exact
+# `aws ecs update-service --task-definition <previous>` in the step summary.
+# With the module's deployment circuit breaker on, a failed rollout is
+# rolled back by ECS and this job fails with the same hint.
+#
+# Caller requirements:
+#   permissions: { id-token: write, contents: read }
+#   secrets.AWS_GITHUB_ACTIONS_ROLE_ARN as an *environment* secret
+#   image from oci-build-push.yml's `image-ref` output (registry set to the
+#   account's ECR host, image = the ECR repository name)
+name: ECS Deploy
+
+on:
+  workflow_call:
+    inputs:
+      cluster:
+        description: "ECS cluster name or ARN"
+        required: true
+        type: string
+      service:
+        description: "ECS service name"
+        required: true
+        type: string
+      image:
+        description: "Immutable image ref (registry/repo@sha256:… or :tag) — oci-build-push's image-ref output"
+        required: true
+        type: string
+      environment:
+        description: "GitHub environment to run under (holds AWS_GITHUB_ACTIONS_ROLE_ARN, may require reviewers)"
+        required: true
+        type: string
+      container-name:
+        description: "Container in the task definition whose image is replaced"
+        required: false
+        type: string
+        default: "app"
+      aws-region:
+        required: false
+        type: string
+        default: "us-east-1"
+      pre-deploy-command:
+        description: "Command run as a one-off task from the NEW revision before the service is updated, e.g. /app/bin/migrate; empty skips"
+        required: false
+        type: string
+        default: ""
+      wait-timeout-minutes:
+        description: "How long to wait for the rollout to converge (running == desired, one deployment)"
+        required: false
+        type: number
+        default: 15
+      health-url:
+        description: "URL probed after the rollout until it returns 2xx/3xx; empty skips"
+        required: false
+        type: string
+        default: ""
+      health-attempts:
+        required: false
+        type: number
+        default: 20
+      force-new-deployment:
+        description: "Pass --force-new-deployment so tasks are replaced even when the image ref is unchanged"
+        required: false
+        type: boolean
+        default: false
+      runner:
+        required: false
+        type: string
+        default: "ubuntu-24.04"
+    secrets:
+      AWS_GITHUB_ACTIONS_ROLE_ARN:
+        description: "Environment-scoped role assumed via OIDC"
+        required: true
+    outputs:
+      task-definition-arn:
+        description: "The new task-definition revision the service now runs"
+        value: ${{ jobs.deploy.outputs.task-definition-arn }}
+      previous-task-definition-arn:
+        description: "The revision the service ran before this deploy, for rollback"
+        value: ${{ jobs.deploy.outputs.previous-task-definition-arn }}
+      image:
+        description: "Image deployed"
+        value: ${{ jobs.deploy.outputs.image }}
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ${{ inputs.runner }}
+    # pre-deploy task (≤10 min waiter) + rollout wait + health probe
+    timeout-minutes: 60
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: ecs-deploy-${{ inputs.cluster }}-${{ inputs.service }}
+      cancel-in-progress: false
+    outputs:
+      task-definition-arn: ${{ steps.register.outputs.task-definition-arn }}
+      previous-task-definition-arn: ${{ steps.current.outputs.task-definition-arn }}
+      image: ${{ steps.result.outputs.image }}
+    env:
+      CLUSTER: ${{ inputs.cluster }}
+      SERVICE: ${{ inputs.service }}
+      CONTAINER: ${{ inputs.container-name }}
+      IMAGE: ${{ inputs.image }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Token sanity
+        run: |
+          # A wrong-environment role fails here with a clear message instead
+          # of halfway through a deploy.
+          aws sts get-caller-identity --query Arn --output text
+          svc=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --output json)
+          if [ "$(jq -r '.failures | length' <<< "$svc")" != "0" ]; then
+            echo "::error::service $SERVICE not found in cluster $CLUSTER: $(jq -c '.failures' <<< "$svc")"; exit 1
+          fi
+          status=$(jq -r '.services[0].status' <<< "$svc")
+          if [ "$status" != "ACTIVE" ]; then
+            echo "::error::service $SERVICE is $status, not ACTIVE"; exit 1
+          fi
+
+      - name: Read current task definition
+        id: current
+        run: |
+          svc=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0]' --output json)
+          arn=$(jq -r '.taskDefinition' <<< "$svc")
+          echo "task-definition-arn=$arn" >> "$GITHUB_OUTPUT"
+          # Saved for the pre-deploy one-off task: same subnets/SGs and
+          # launch model as the service itself.
+          jq -c '.networkConfiguration' <<< "$svc" > "$RUNNER_TEMP/network.json"
+          jq -c '{launchType, capacityProviderStrategy, platformVersion}' <<< "$svc" > "$RUNNER_TEMP/launch.json"
+          aws ecs describe-task-definition --task-definition "$arn" --query taskDefinition --output json \
+            > "$RUNNER_TEMP/current-taskdef.json"
+          echo "current: $arn"
+
+      - name: Register new revision
+        id: register
+        run: |
+          cur="$RUNNER_TEMP/current-taskdef.json"
+          if [ "$(jq --arg c "$CONTAINER" '[.containerDefinitions[] | select(.name == $c)] | length' "$cur")" = "0" ]; then
+            echo "::error::no container named '$CONTAINER' in $(jq -r '.family' "$cur"); have: $(jq -r '[.containerDefinitions[].name] | join(", ")' "$cur")"
+            exit 1
+          fi
+          jq --arg c "$CONTAINER" --arg img "$IMAGE" '
+            .containerDefinitions |= map(if .name == $c then .image = $img else . end)
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities,
+                  .registeredAt, .registeredBy, .deregisteredAt)
+          ' "$cur" > "$RUNNER_TEMP/new-taskdef.json"
+          new=$(aws ecs register-task-definition --cli-input-json "file://$RUNNER_TEMP/new-taskdef.json" \
+                  --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "task-definition-arn=$new" >> "$GITHUB_OUTPUT"
+          echo "registered: $new"
+
+      - name: Pre-deploy task
+        if: inputs.pre-deploy-command != ''
+        env:
+          PRE_DEPLOY_COMMAND: ${{ inputs.pre-deploy-command }}
+        run: |
+          new="${{ steps.register.outputs.task-definition-arn }}"
+          read -ra words <<< "$PRE_DEPLOY_COMMAND"
+          overrides=$(jq -nc --arg c "$CONTAINER" '{containerOverrides: [{name: $c, command: $ARGS.positional}]}' --args "${words[@]}")
+          args=(run-task --cluster "$CLUSTER" --task-definition "$new" --overrides "$overrides"
+                --network-configuration "$(cat "$RUNNER_TEMP/network.json")"
+                --started-by "github-${GITHUB_RUN_ID}")
+          if [ "$(jq -r '.launchType // empty' "$RUNNER_TEMP/launch.json")" != "" ]; then
+            args+=(--launch-type "$(jq -r '.launchType' "$RUNNER_TEMP/launch.json")")
+          else
+            args+=(--capacity-provider-strategy "$(jq -c '.capacityProviderStrategy' "$RUNNER_TEMP/launch.json")")
+          fi
+          pv=$(jq -r '.platformVersion // empty' "$RUNNER_TEMP/launch.json")
+          [ -n "$pv" ] && args+=(--platform-version "$pv")
+
+          out=$(aws ecs "${args[@]}" --output json)
+          if [ "$(jq -r '.failures | length' <<< "$out")" != "0" ]; then
+            echo "::error::run-task failed: $(jq -c '.failures' <<< "$out")"; exit 1
+          fi
+          task=$(jq -r '.tasks[0].taskArn' <<< "$out")
+          task_id="${task##*/}"
+          echo "running \`$PRE_DEPLOY_COMMAND\` as task $task_id"
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$task"
+
+          done_json=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task" --query 'tasks[0]' --output json)
+          code=$(jq -r --arg c "$CONTAINER" '.containers[] | select(.name == $c) | .exitCode // "none"' <<< "$done_json")
+          reason=$(jq -r '.stoppedReason // ""' <<< "$done_json")
+
+          # Tail the container's awslogs stream: <prefix>/<container>/<task id>.
+          logcfg=$(jq -c --arg c "$CONTAINER" '.containerDefinitions[] | select(.name == $c) | .logConfiguration // {}' "$RUNNER_TEMP/new-taskdef.json")
+          if [ "$(jq -r '.logDriver // ""' <<< "$logcfg")" = "awslogs" ]; then
+            group=$(jq -r '.options["awslogs-group"]' <<< "$logcfg")
+            prefix=$(jq -r '.options["awslogs-stream-prefix"] // ""' <<< "$logcfg")
+            region=$(jq -r '.options["awslogs-region"] // "${{ inputs.aws-region }}"' <<< "$logcfg")
+            stream="${prefix:+$prefix/}$CONTAINER/$task_id"
+            echo "--- last 50 lines of $group / $stream ---"
+            aws logs get-log-events --region "$region" --log-group-name "$group" --log-stream-name "$stream" \
+              --limit 50 --query 'events[].message' --output text 2>/dev/null || echo "(no log events yet)"
+            echo "--- end ---"
+          fi
+
+          if [ "$code" != "0" ]; then
+            echo "::error::pre-deploy task $task_id exited $code (${reason:-no stop reason}); service not updated"
+            exit 1
+          fi
+          echo "pre-deploy task $task_id exited 0"
+
+      - name: Update service
+        run: |
+          args=(update-service --cluster "$CLUSTER" --service "$SERVICE"
+                --task-definition "${{ steps.register.outputs.task-definition-arn }}")
+          if [ "${{ inputs.force-new-deployment }}" = "true" ]; then
+            args+=(--force-new-deployment)
+          fi
+          aws ecs "${args[@]}" --query 'service.deployments[0].{id:id,status:status,taskDefinition:taskDefinition}' --output json
+
+      - name: Wait for rollout
+        run: |
+          # `aws ecs wait services-stable` gives up after a fixed 10 min, so
+          # poll describe-services until one deployment remains at the new
+          # revision with running == desired, or the circuit breaker trips.
+          new="${{ steps.register.outputs.task-definition-arn }}"
+          prev="${{ steps.current.outputs.task-definition-arn }}"
+          rollback="aws ecs update-service --cluster $CLUSTER --service $SERVICE --task-definition $prev"
+          deadline=$(( $(date +%s) + ${{ inputs.wait-timeout-minutes }} * 60 ))
+          while :; do
+            svc=$(aws ecs describe-services --cluster "$CLUSTER" --services "$SERVICE" --query 'services[0]' --output json)
+            count=$(jq -r '.deployments | length' <<< "$svc")
+            primary=$(jq -c '.deployments[] | select(.status == "PRIMARY")' <<< "$svc")
+            primary_td=$(jq -r '.taskDefinition' <<< "$primary")
+            rollout=$(jq -r '.rolloutState // "N/A"' <<< "$primary")
+            running=$(jq -r '.runningCount' <<< "$primary")
+            desired=$(jq -r '.desiredCount' <<< "$primary")
+            echo "$(date -u +%H:%M:%S) deployments=$count rollout=$rollout running=$running/$desired primary=${primary_td##*/}"
+
+            if [ "$rollout" = "FAILED" ]; then
+              echo "::error::rollout of ${new##*/} FAILED (circuit breaker): $(jq -r '.rolloutStateReason // ""' <<< "$primary"). Rollback: $rollback"
+              jq -r '.events[:10][] | "\(.createdAt)  \(.message)"' <<< "$svc"; exit 1
+            fi
+            if [ "$primary_td" != "$new" ]; then
+              echo "::error::service primary deployment is ${primary_td##*/}, not ${new##*/} — ECS rolled back or another deploy superseded this one"
+              jq -r '.events[:10][] | "\(.createdAt)  \(.message)"' <<< "$svc"; exit 1
+            fi
+            if [ "$count" = "1" ] && [ "$running" = "$desired" ] && [ "$rollout" != "IN_PROGRESS" ]; then
+              echo "rollout complete: $running/$desired tasks on ${new##*/}"; break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::rollout did not converge within ${{ inputs.wait-timeout-minutes }} min. Rollback: $rollback"
+              jq -r '.events[:10][] | "\(.createdAt)  \(.message)"' <<< "$svc"; exit 1
+            fi
+            sleep 15
+          done
+
+      - name: Health probe
+        if: inputs.health-url != ''
+        run: |
+          for i in $(seq 1 ${{ inputs.health-attempts }}); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "${{ inputs.health-url }}" || echo 000)
+            case "$code" in 2*|3*) echo "healthy ($code) after $i attempt(s)"; exit 0;; esac
+            echo "attempt $i: $code"; sleep 6
+          done
+          echo "::error::${{ inputs.health-url }} never returned 2xx/3xx"; exit 1
+
+      - name: Record deployment
+        id: result
+        if: always()
+        run: |
+          set +e
+          new="${{ steps.register.outputs.task-definition-arn }}"
+          prev="${{ steps.current.outputs.task-definition-arn }}"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ECS: $CLUSTER / $SERVICE (${{ inputs.environment }})"
+            echo
+            echo "| | |"; echo "|---|---|"
+            echo "| Image | \`$IMAGE\` |"
+            echo "| Container | \`$CONTAINER\` |"
+            echo "| New task definition | \`${new:-not registered}\` |"
+            echo "| Previous task definition | \`${prev:-unknown}\` |"
+            echo
+            if [ -n "$prev" ]; then
+              echo "Rollback:"; echo '```'
+              echo "aws ecs update-service --cluster $CLUSTER --service $SERVICE --task-definition $prev"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,22 @@
+# .github/workflows/release.yml in the consuming repo.
+# The owner pushes a signed annotated tag; CI builds, boot-checks, attests,
+# and attaches to a DRAFT release the owner publishes.
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:   # dry run without a tag: builds + smoke, no upload
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    uses: kyleswiger/aws-reusable-workflows/.github/workflows/otp-release.yml@v1.1.0
+    with:
+      releases: hacktui_hub,hacktui_sensor
+      smoke-command: /rel/bin/$RELEASE eval 'IO.puts(:booted)'
+      smoke-env: |
+        HACKTUI_START_REPO=false

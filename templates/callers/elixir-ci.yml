@@ -1,0 +1,25 @@
+# .github/workflows/ci.yml in the consuming repo.
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Ruleset contexts will be "ci / format", "ci / test", "ci / dialyzer", ...
+  ci:
+    uses: kyleswiger/aws-reusable-workflows/.github/workflows/elixir-ci.yml@v1.1.0
+    with:
+      umbrella: false
+      postgres: true
+      postgres-db: my_app_test
+      test-setup-command: mix ecto.create --quiet && mix ecto.migrate --quiet
+      sobelow: true            # false for non-Phoenix projects
+      audit-blocking: true

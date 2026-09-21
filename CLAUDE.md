@@ -8,6 +8,10 @@ This repository holds **Reusable GitHub Actions workflows** (`workflow_call`). I
 ## Architecture & Tenets
 - **No Hardcoded Secrets:** Workflows must expect secrets to be passed in from the caller (e.g., `secrets: inherit` or explicit `inputs`).
 - **OIDC Authentication:** AWS access must rely on `aws-actions/configure-aws-credentials` using GitHub OIDC, never long-lived access keys.
+- **Non-AWS targets get scoped tokens, not shared ones:** fly.io has no OIDC federation; `fly-deploy.yml` requires a GitHub `environment` so each app's deploy token is environment-scoped and prod can require a reviewer.
+- **No-secret workflows are the default:** `elixir-ci.yml`, `oci-build-push.yml` (GHCR) and `otp-release.yml` take no secrets so consumers can pin them by tag. Anything that receives a deploy token documents that it must be SHA-pinned.
+- **Job ids are public API:** they are the status-check contexts consumers' rulesets require. Renaming one orphans a required check and blocks every merge downstream.
+- **Composite actions are fetched at `job.workflow_sha`:** reusable workflows cannot reference `./.github/actions` relatively, and an `@main` reference would float past the caller's pin.
 - **Agentic Reviews:** Pull Request workflows should integrate AI review steps (e.g., Claude/Gemini) automatically for consuming repositories.
 
 ## Future Master Plan

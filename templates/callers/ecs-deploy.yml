@@ -1,0 +1,45 @@
+# .github/workflows/deploy.yml in the consuming repo.
+# Build once → ECR → ECS Fargate service, same image digest throughout.
+# Terraform (ecs-fargate-service module) owns the service and the task
+# definition's shape; this pipeline only swaps the image.
+name: Deploy
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  image:
+    uses: kyleswiger/aws-reusable-workflows/.github/workflows/oci-build-push.yml@v1.1.0
+    with:
+      # ECR: registry is the account host, image is the ECR repository name.
+      registry: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+      image: myapp
+      dockerfile: Dockerfile
+      platforms: linux/arm64        # Graviton task; ARM is ~20% cheaper on Fargate
+    secrets:
+      AWS_GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+
+  deploy:
+    needs: image
+    uses: kyleswiger/aws-reusable-workflows/.github/workflows/ecs-deploy.yml@v1.1.0
+    with:
+      cluster: myapp
+      service: myapp
+      image: ${{ needs.image.outputs.image-ref }}
+      environment: production      # required reviewer configured on the environment
+      pre-deploy-command: /app/bin/migrate
+      health-url: https://example.com/healthz
+    secrets:
+      # The same secret name as the image job: it is an *environment* secret,
+      # so the role this job assumes is the one scoped to `production`
+      # (ECR push + ECS deploy on this service), never a staging role.
+      AWS_GITHUB_ACTIONS_ROLE_ARN: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}

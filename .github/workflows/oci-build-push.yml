@@ -1,0 +1,171 @@
+# Build an OCI image once and push it to GHCR (default) or ECR, with a
+# BuildKit cache in GitHub's cache backend and a SLSA build-provenance
+# attestation on the digest. Downstream deploy jobs (fly-deploy.yml, the
+# Lambda workflows) take the image-ref output, so staging and prod run the
+# SAME digest — rollback is a redeploy of a previous ref, never a rebuild.
+#
+# Tags (docker/metadata-action): sha-<full sha>, the branch or PR ref,
+# semver from a v* tag, and `latest` on the default branch only.
+#
+# Caller requirements:
+#   permissions: { contents: read, packages: write, id-token: write, attestations: write }
+#   for ECR: secrets.AWS_GITHUB_ACTIONS_ROLE_ARN and registry set to the
+#   account registry host (123456789012.dkr.ecr.us-east-1.amazonaws.com)
+name: OCI Build and Push
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: "Image name without registry, e.g. hacktuah/aylacroft (lower-cased automatically)"
+        required: true
+        type: string
+      registry:
+        description: "Registry host: ghcr.io or an ECR registry host"
+        required: false
+        type: string
+        default: "ghcr.io"
+      dockerfile:
+        required: false
+        type: string
+        default: "Dockerfile"
+      context:
+        required: false
+        type: string
+        default: "."
+      platforms:
+        description: "Comma-separated target platforms. Multi-arch needs QEMU and roughly doubles build time"
+        required: false
+        type: string
+        default: "linux/amd64"
+      build-args:
+        description: "KEY=VALUE lines passed as --build-arg"
+        required: false
+        type: string
+        default: ""
+      push:
+        description: "Push the image; false builds (and caches) only, e.g. on pull requests"
+        required: false
+        type: boolean
+        default: true
+      provenance:
+        description: "Attach a SLSA build-provenance attestation to the pushed digest"
+        required: false
+        type: boolean
+        default: true
+      extra-tags:
+        description: "Additional docker/metadata-action tag rules, one per line"
+        required: false
+        type: string
+        default: ""
+      aws-region:
+        required: false
+        type: string
+        default: "us-east-1"
+      runner:
+        required: false
+        type: string
+        default: "ubuntu-24.04"
+    secrets:
+      AWS_GITHUB_ACTIONS_ROLE_ARN:
+        description: "Only for ECR registries; assumed via OIDC"
+        required: false
+    outputs:
+      image-ref:
+        description: "Immutable reference registry/image@sha256:… (empty when push=false)"
+        value: ${{ jobs.build.outputs.image-ref }}
+      digest:
+        value: ${{ jobs.build.outputs.digest }}
+      tags:
+        description: "Newline-separated pushed tags"
+        value: ${{ jobs.build.outputs.tags }}
+
+jobs:
+  build:
+    name: build
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    outputs:
+      image-ref: ${{ steps.ref.outputs.image-ref }}
+      digest: ${{ steps.push.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve image name
+        id: name
+        run: echo "image=$(echo '${{ inputs.registry }}/${{ inputs.image }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        if: inputs.registry == 'ghcr.io' && inputs.push
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS credentials (OIDC)
+        if: inputs.registry != 'ghcr.io' && inputs.push
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ inputs.aws-region }}
+      - name: Login to ECR
+        if: inputs.registry != 'ghcr.io' && inputs.push
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up QEMU
+        if: contains(inputs.platforms, ',') || !contains(inputs.platforms, 'amd64')
+        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=sha,format=long,prefix=sha-
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            ${{ inputs.extra-tags }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ inputs.build-args }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # buildx's own provenance/sbom would make the pushed artifact a
+          # manifest list even for one platform, which some consumers
+          # (Lambda) reject; GitHub's attestation below covers provenance.
+          provenance: false
+
+      - name: Immutable reference
+        id: ref
+        if: inputs.push
+        run: |
+          ref="${{ steps.name.outputs.image }}@${{ steps.push.outputs.digest }}"
+          echo "image-ref=$ref" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Image"; echo; echo '```'; echo "$ref"; echo '```'
+            echo "Tags:"; echo '```'; echo "${{ steps.meta.outputs.tags }}"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Attest build provenance
+        if: inputs.push && inputs.provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.name.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: ${{ inputs.registry == 'ghcr.io' }}

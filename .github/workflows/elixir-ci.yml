@@ -1,0 +1,438 @@
+# Elixir/OTP CI as independent jobs. Each gate is its own job so a consumer
+# can require them individually in a ruleset and so one red gate never hides
+# another's verdict (the same shape as HackTUI's ci.yml, minus its ratchets).
+#
+# Job ids double as status-check contexts. In a reusable workflow the context
+# a ruleset sees is "<caller job name> / <job name here>", e.g. "ci / test".
+# Renaming a job renames its context and orphans any ruleset that required it.
+#
+# Caller requirements:
+#   permissions: { contents: read }
+#   trigger: pull_request (+ push to main if you want main gated too)
+#   a .tool-versions at the repo root (or otp-version/elixir-version inputs)
+#
+# The composite action is fetched from THIS repo at job.workflow_sha —
+# the exact commit the caller pinned — into ./.tooling. A reusable workflow
+# cannot reference ./.github/actions relatively (the checkout is the caller's
+# repo) and an @main reference would silently float past the caller's pin.
+#
+# No secrets are accepted: nothing here needs one, and a CI workflow that
+# never receives a secret is one a consumer can pin by tag without trusting
+# this repo with anything.
+name: Elixir CI
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory containing mix.exs"
+        required: false
+        type: string
+        default: "."
+      version-file:
+        description: "asdf/mise file the OTP + Elixir versions are read from"
+        required: false
+        type: string
+        default: ".tool-versions"
+      otp-version:
+        description: "Explicit OTP version (overrides version-file)"
+        required: false
+        type: string
+        default: ""
+      elixir-version:
+        description: "Explicit Elixir version (overrides version-file)"
+        required: false
+        type: string
+        default: ""
+      runner:
+        description: "Runner label"
+        required: false
+        type: string
+        default: "ubuntu-24.04"
+      umbrella:
+        description: "Umbrella project: sobelow runs per apps/*, xref adds --include-siblings"
+        required: false
+        type: boolean
+        default: false
+      check-unused-deps:
+        description: "Fail on mix.lock entries no longer in mix.exs (mix deps.unlock --check-unused)"
+        required: false
+        type: boolean
+        default: true
+      credo:
+        description: "Run credo"
+        required: false
+        type: boolean
+        default: true
+      credo-args:
+        description: "Arguments for mix credo"
+        required: false
+        type: string
+        default: "--strict"
+      sobelow:
+        description: "Run sobelow (Phoenix-focused SAST; set false for non-Phoenix projects)"
+        required: false
+        type: boolean
+        default: true
+      sobelow-args:
+        description: "Arguments for mix sobelow; --exit fails on any finding, --exit medium on medium+"
+        required: false
+        type: string
+        default: "--exit"
+      audit:
+        description: "Run mix hex.audit (retired packages) and mix deps.audit (mix_audit CVE feed)"
+        required: false
+        type: boolean
+        default: true
+      audit-blocking:
+        description: "Fail the audit job on findings; false records them as a warning only"
+        required: false
+        type: boolean
+        default: true
+      xref-fail-above:
+        description: "mix xref graph --format cycles --label compile-connected --fail-above N; -1 skips the job"
+        required: false
+        type: number
+        default: 0
+      dialyzer:
+        description: "Run dialyzer (needs dialyxir in deps and plt_core_path/plt_local_path set to plt-path)"
+        required: false
+        type: boolean
+        default: true
+      dialyzer-args:
+        description: "Arguments for mix dialyzer"
+        required: false
+        type: string
+        default: "--format github"
+      plt-path:
+        description: "PLT directory relative to working-directory"
+        required: false
+        type: string
+        default: "priv/plts"
+      test-args:
+        description: "Extra arguments for mix test (e.g. --include integration)"
+        required: false
+        type: string
+        default: ""
+      coverage:
+        description: "Run mix test --cover (a threshold in mix.exs test_coverage: makes it fail below the line)"
+        required: false
+        type: boolean
+        default: false
+      test-env:
+        description: "KEY=VALUE lines exported for the test job"
+        required: false
+        type: string
+        default: ""
+      postgres:
+        description: "Start a Postgres service container for the test job"
+        required: false
+        type: boolean
+        default: false
+      postgres-image:
+        description: "Postgres image for the service container"
+        required: false
+        type: string
+        default: "postgres:17"
+      postgres-user:
+        required: false
+        type: string
+        default: "postgres"
+      postgres-password:
+        description: "Throwaway password for the ephemeral CI database; not a secret"
+        required: false
+        type: string
+        default: "postgres"
+      postgres-db:
+        required: false
+        type: string
+        default: "app_test"
+      test-setup-command:
+        description: "Command run before mix test (e.g. mix ecto.create && mix ecto.migrate); empty skips"
+        required: false
+        type: string
+        default: ""
+      mix-env:
+        description: "MIX_ENV for the compile/test jobs"
+        required: false
+        type: string
+        default: "test"
+      lint-mix-env:
+        description: "MIX_ENV for credo/dialyzer/sobelow/xref. Keep it stable: the PLT is built per env"
+        required: false
+        type: string
+        default: "dev"
+
+env:
+  MIX_ENV: ${{ inputs.mix-env }}
+
+jobs:
+  format:
+    name: format
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kyleswiger/aws-reusable-workflows
+          ref: ${{ job.workflow_sha }}
+          path: .tooling
+      - uses: ./.tooling/.github/actions/setup-beam-cached
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          version-file: ${{ inputs.version-file }}
+          otp-version: ${{ inputs.otp-version }}
+          elixir-version: ${{ inputs.elixir-version }}
+          cache-prefix: mix-${{ inputs.mix-env }}
+      - run: mix format --check-formatted
+        working-directory: ${{ inputs.working-directory }}
+
+  compile:
+    name: compile
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kyleswiger/aws-reusable-workflows
+          ref: ${{ job.workflow_sha }}
+          path: .tooling
+      - uses: ./.tooling/.github/actions/setup-beam-cached
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          version-file: ${{ inputs.version-file }}
+          otp-version: ${{ inputs.otp-version }}
+          elixir-version: ${{ inputs.elixir-version }}
+          cache-prefix: mix-${{ inputs.mix-env }}
+      - run: mix compile --warnings-as-errors --force
+        working-directory: ${{ inputs.working-directory }}
+
+  deps:
+    name: deps
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kyleswiger/aws-reusable-workflows
+          ref: ${{ job.workflow_sha }}
+          path: .tooling
+      - uses: ./.tooling/.github/actions/setup-beam-cached
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          version-file: ${{ inputs.version-file }}
+          otp-version: ${{ inputs.otp-version }}
+          elixir-version: ${{ inputs.elixir-version }}
+          cache-prefix: mix-${{ inputs.mix-env }}
+      - name: mix deps.unlock --check-unused
+        if: inputs.check-unused-deps
+        run: mix deps.unlock --check-unused
+        working-directory: ${{ inputs.working-directory }}
+      - name: Dependency audits
+        if: inputs.audit
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set +e
+          fail=0
+          echo "## hex.audit" >> "$GITHUB_STEP_SUMMARY"
+          mix hex.audit 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || fail=1
+          echo "## deps.audit" >> "$GITHUB_STEP_SUMMARY"
+          # deps.loadpaths first: in an umbrella mix_audit cannot load its own
+          # yaml_elixir dependency otherwise and crashes instead of reporting.
+          # shellcheck disable=SC1010  # `do` is mix's task name, not a keyword
+          mix do deps.loadpaths + deps.audit 2>&1 | tee -a "$GITHUB_STEP_SUMMARY" || fail=1
+          if [ "$fail" -ne 0 ]; then
+            if [ "${{ inputs.audit-blocking }}" = "true" ]; then
+              echo "::error::dependency audit reported findings"; exit 1
+            fi
+            echo "::warning::dependency audit reported findings (audit-blocking: false)"
+          fi
+
+  credo:
+    name: credo
+    if: inputs.credo
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    env:
+      MIX_ENV: ${{ inputs.lint-mix-env }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kyleswiger/aws-reusable-workflows
+          ref: ${{ job.workflow_sha }}
+          path: .tooling
+      - uses: ./.tooling/.github/actions/setup-beam-cached
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          version-file: ${{ inputs.version-file }}
+          otp-version: ${{ inputs.otp-version }}
+          elixir-version: ${{ inputs.elixir-version }}
+          cache-prefix: mix-${{ inputs.lint-mix-env }}
+      - run: mix credo ${{ inputs.credo-args }}
+        working-directory: ${{ inputs.working-directory }}
+
+  sobelow:
+    name: sobelow
+    if: inputs.sobelow
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    env:
+      MIX_ENV: ${{ inputs.lint-mix-env }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kyleswiger/aws-reusable-workflows
+          ref: ${{ job.workflow_sha }}
+          path: .tooling
+      - uses: ./.tooling/.github/actions/setup-beam-cached
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          version-file: ${{ inputs.version-file }}
+          otp-version: ${{ inputs.otp-version }}
+          elixir-version: ${{ inputs.elixir-version }}
+          cache-prefix: mix-${{ inputs.lint-mix-env }}
+      - name: mix sobelow
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if [ "${{ inputs.umbrella }}" = "true" ]; then
+            status=0
+            for app in apps/*/; do
+              echo "== $app"
+              mix sobelow --root "$app" ${{ inputs.sobelow-args }} || status=1
+            done
+            exit $status
+          fi
+          mix sobelow ${{ inputs.sobelow-args }}
+
+  xref:
+    name: xref
+    if: inputs.xref-fail-above >= 0
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    env:
+      MIX_ENV: ${{ inputs.lint-mix-env }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kyleswiger/aws-reusable-workflows
+          ref: ${{ job.workflow_sha }}
+          path: .tooling
+      - uses: ./.tooling/.github/actions/setup-beam-cached
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          version-file: ${{ inputs.version-file }}
+          otp-version: ${{ inputs.otp-version }}
+          elixir-version: ${{ inputs.elixir-version }}
+          cache-prefix: mix-${{ inputs.lint-mix-env }}
+      - name: Compile-time dependency cycles
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          siblings=""
+          [ "${{ inputs.umbrella }}" = "true" ] && siblings="--include-siblings"
+          mix xref graph --format cycles --label compile-connected \
+            --fail-above ${{ inputs.xref-fail-above }} $siblings
+
+  test:
+    name: test
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    services:
+      postgres:
+        # An empty image is a documented way to skip a service; the block
+        # itself cannot be conditional.
+        image: ${{ inputs.postgres && inputs.postgres-image || '' }}
+        env:
+          POSTGRES_USER: ${{ inputs.postgres-user }}
+          POSTGRES_PASSWORD: ${{ inputs.postgres-password }}
+          POSTGRES_DB: ${{ inputs.postgres-db }}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kyleswiger/aws-reusable-workflows
+          ref: ${{ job.workflow_sha }}
+          path: .tooling
+      - uses: ./.tooling/.github/actions/setup-beam-cached
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          version-file: ${{ inputs.version-file }}
+          otp-version: ${{ inputs.otp-version }}
+          elixir-version: ${{ inputs.elixir-version }}
+          cache-prefix: mix-${{ inputs.mix-env }}
+      - name: Export test environment
+        if: inputs.test-env != '' || inputs.postgres
+        run: |
+          if [ "${{ inputs.postgres }}" = "true" ]; then
+            {
+              echo "DATABASE_URL=postgres://${{ inputs.postgres-user }}:${{ inputs.postgres-password }}@localhost:5432/${{ inputs.postgres-db }}"
+              echo "PGHOST=localhost"; echo "PGPORT=5432"
+              echo "PGUSER=${{ inputs.postgres-user }}"; echo "PGPASSWORD=${{ inputs.postgres-password }}"
+              echo "PGDATABASE=${{ inputs.postgres-db }}"
+            } >> "$GITHUB_ENV"
+          fi
+          # KEY=VALUE lines from the caller; blank lines and # comments ignored.
+          # Quoted heredoc: the input is never re-parsed by the shell, so quotes
+          # or backslashes in a value cannot break out of the script.
+          grep -Ev '^\s*(#|$)' <<'CALLER_ENV' >> "$GITHUB_ENV" || true
+          ${{ inputs.test-env }}
+          CALLER_ENV
+      - name: Test setup
+        if: inputs.test-setup-command != ''
+        run: ${{ inputs.test-setup-command }}
+        working-directory: ${{ inputs.working-directory }}
+      - name: mix test
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          cover=""
+          [ "${{ inputs.coverage }}" = "true" ] && cover="--cover"
+          mix test --warnings-as-errors $cover ${{ inputs.test-args }}
+
+  dialyzer:
+    name: dialyzer
+    if: inputs.dialyzer
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 40
+    env:
+      MIX_ENV: ${{ inputs.lint-mix-env }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kyleswiger/aws-reusable-workflows
+          ref: ${{ job.workflow_sha }}
+          path: .tooling
+      - id: beam
+        uses: ./.tooling/.github/actions/setup-beam-cached
+        with:
+          working-directory: ${{ inputs.working-directory }}
+          version-file: ${{ inputs.version-file }}
+          otp-version: ${{ inputs.otp-version }}
+          elixir-version: ${{ inputs.elixir-version }}
+          cache-prefix: mix-${{ inputs.lint-mix-env }}
+          plt: "true"
+          plt-path: ${{ inputs.plt-path }}
+      - name: Build PLT
+        if: steps.beam.outputs.plt-cache-hit != 'true'
+        run: mix dialyzer --plt
+        working-directory: ${{ inputs.working-directory }}
+      # Saved BEFORE the analysis runs, so a red dialyzer still keeps the PLT
+      # (a plain actions/cache only saves on job success, and a PLT rebuild is
+      # the slowest step in the whole pipeline).
+      - name: Save PLT
+        if: steps.beam.outputs.plt-cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ inputs.working-directory }}/${{ inputs.plt-path }}
+          key: ${{ steps.beam.outputs.plt-cache-key }}
+      - run: mix dialyzer ${{ inputs.dialyzer-args }}
+        working-directory: ${{ inputs.working-directory }}
