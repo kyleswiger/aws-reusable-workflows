@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/kyleswiger/aws-reusable-workflows/compare/v1.0.1...v1.1.0) (2026-09-21)
+
+
+### Features
+
+* Elixir/BEAM CI, fly.io and ECS deploy workflows ([#7](https://github.com/kyleswiger/aws-reusable-workflows/issues/7)) ([8f34825](https://github.com/kyleswiger/aws-reusable-workflows/commit/8f34825870a445ed73166130399d54b0bf96fec5))
+
 ## [1.0.1](https://github.com/kyleswiger/aws-reusable-workflows/compare/v1.0.0...v1.0.1) (2026-08-13)
 
 
