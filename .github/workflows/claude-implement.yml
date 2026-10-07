@@ -1,0 +1,126 @@
+# Turn a labelled GitHub issue into a pull request with Claude Code.
+#
+# One bounded run per issue: read the issue, implement on a fresh branch,
+# run the repo's deterministic checks, open a PR that closes the issue. The
+# run never merges and never deploys; branch rulesets and human review stay
+# the gate. Runs are serialised per repo so a burst of labels cannot drain
+# the subscription's 5-hour window in one go.
+#
+# Billing: the OAuth token bills the Claude Max subscription. Keep
+# `max-turns` modest and prefer Sonnet; Opus is for planning, not plumbing.
+#
+# Caller requirements:
+#   permissions: { contents: write, pull-requests: write, issues: write, id-token: write }
+#   trigger:     issues [labeled]  (filter on the label in the caller's `if:`)
+#   secrets:     CLAUDE_CODE_OAUTH_TOKEN (or `secrets: inherit`)
+#   The Claude GitHub App must be installed on the repo so the PR it opens
+#   triggers CI; PRs pushed with the plain GITHUB_TOKEN do not start workflows.
+name: Claude Implement
+
+on:
+  workflow_call:
+    inputs:
+      issue-number:
+        description: "Issue to implement"
+        required: true
+        type: number
+      model:
+        description: "Model alias or ID passed to --model"
+        required: false
+        type: string
+        default: 'sonnet'
+      max-turns:
+        description: "Upper bound on agent turns; the run stops and reports when it is hit"
+        required: false
+        type: number
+        default: 30
+      verify:
+        description: "Shell commands the agent must run green before opening the PR (e.g. 'pytest -q && npx tsc --noEmit')"
+        required: false
+        type: string
+        default: ''
+      max-diff-lines:
+        description: "Soft cap on added+removed lines; above it the agent must split the work and say so"
+        required: false
+        type: number
+        default: 400
+      extra-allowed-tools:
+        description: "Comma-separated additional --allowedTools entries (e.g. 'Bash(mix test:*)')"
+        required: false
+        type: string
+        default: ''
+      branch-prefix:
+        description: "Branch name prefix; the issue number is appended"
+        required: false
+        type: string
+        default: 'agent/issue-'
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+
+jobs:
+  implement:
+    runs-on: ubuntu-24.04
+    # One factory run at a time per repo. cancel-in-progress is deliberately
+    # off: a half-finished implementation is worse than a queued one.
+    concurrency:
+      group: claude-implement-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history: the agent reads git log/blame to match conventions.
+          fetch-depth: 0
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          show_full_output: true
+          prompt: |
+            You are the implementation station of a software factory. Your job is
+            to turn issue #${{ inputs.issue-number }} in ${{ github.repository }}
+            into one reviewable pull request. You do not merge and you do not deploy.
+
+            Procedure:
+            1. Read the issue with `gh issue view ${{ inputs.issue-number }} --comments`.
+               If it has no acceptance criteria you can test against, comment on
+               the issue asking for them, label nothing, and stop.
+            2. Read CLAUDE.md and the surrounding code before changing anything.
+               Match the repo's conventions; do not add dependencies when the
+               standard library will do.
+            3. Create branch `${{ inputs.branch-prefix }}${{ inputs.issue-number }}`
+               from the current HEAD. Make the smallest change that satisfies the
+               acceptance criteria. Keep the diff under ${{ inputs.max-diff-lines }}
+               added+removed lines; if that is impossible, implement the first
+               self-contained slice, and describe the remaining slices in the PR.
+            4. Verification is mandatory and must be green before you open a PR.
+               Run: `${{ inputs.verify }}`
+               If that string is empty, run whatever the repo's CI runs
+               (pytest, `npx tsc --noEmit`, `terraform fmt -check && terraform validate`,
+               `mix test`, as applicable). Never weaken, skip, or delete a failing
+               test to get green. If you cannot get green, open the PR as a draft
+               and say exactly what fails.
+            5. Commit with a conventional-commit message (feat/fix/chore/docs)
+               and end the message with
+               `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
+               Push the branch.
+            6. Open the PR with `gh pr create`. The body must contain
+               `Closes #${{ inputs.issue-number }}`, a short summary, the exact
+               verification commands you ran and their result, and end with
+               `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+            7. Comment the PR link on the issue.
+
+            Hard limits: never touch .github/workflows, never run terraform apply
+            or any AWS write, never force-push, never edit files outside this
+            repository. If the task needs any of those, stop and explain on the issue.
+          claude_args: >-
+            --model ${{ inputs.model }}
+            --max-turns ${{ inputs.max-turns }}
+            --allowedTools "Read,Edit,Write,MultiEdit,Grep,Glob,TodoWrite,Task,Bash(git:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh pr create:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(pytest:*),Bash(python -m pytest:*),Bash(npm ci:*),Bash(npm test:*),Bash(npm run:*),Bash(npx tsc:*),Bash(terraform fmt:*),Bash(terraform init:*),Bash(terraform validate:*),Bash(mix:*),Bash(ls:*),Bash(cat:*)${{ inputs.extra-allowed-tools != '' && format(',{0}', inputs.extra-allowed-tools) || '' }}"
