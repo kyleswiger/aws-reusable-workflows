@@ -317,6 +317,16 @@ jobs:
               --function-url-auth-type NONE 2>&1); then
             echo "$PERM_OUT" | grep -q ResourceConflictException || { echo "$PERM_OUT" >&2; exit 1; }
           fi
+          # Public Function URLs created since AWS's Oct 2025 change also need
+          # lambda:InvokeFunction, scoped to URL invokes via the
+          # lambda:InvokedViaFunctionUrl condition. Without it the URL 403s.
+          if ! PERM_OUT=$(aws lambda add-permission --function-name "$FN" \
+              --statement-id FunctionURLInvokeAllowPublicAccess \
+              --action lambda:InvokeFunction \
+              --principal '*' \
+              --invoked-via-function-url 2>&1); then
+            echo "$PERM_OUT" | grep -q ResourceConflictException || { echo "$PERM_OUT" >&2; exit 1; }
+          fi
           URL=$(aws lambda get-function-url-config --function-name "$FN" --query FunctionUrl --output text)
           URL="${URL%/}"
           echo "api-url=$URL" >> "$GITHUB_OUTPUT"
