@@ -124,6 +124,40 @@ appends required checks to an **existing** ruleset by name instead of
 replacing it (use this, not `apply-branch-ruleset.sh`, on a repo that already
 has its own ruleset).
 
+## Software factory: issue → PR
+
+`claude-implement.yml` turns a labelled issue into a pull request with Claude
+Code on the Max subscription (OAuth token). It never merges or deploys; the
+repo's ruleset and your review remain the gate. Runs are serialised per repo
+and capped by `max-turns`. Pair it with `templates/ISSUE_TEMPLATE/agent-task.yml`
+so every agent run starts from testable acceptance criteria.
+
+### Caller example — implement
+
+```yaml
+# .github/workflows/claude-implement.yml
+name: Claude implement
+on:
+  issues:
+    types: [labeled]
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  id-token: write
+jobs:
+  implement:
+    if: github.event.label.name == 'agent:claude'
+    uses: kyleswiger/aws-reusable-workflows/.github/workflows/claude-implement.yml@v1
+    with:
+      issue-number: ${{ github.event.issue.number }}
+      verify: 'pytest -q && npx --prefix frontend tsc --noEmit'
+    secrets: inherit
+```
+
+Requires the Claude GitHub App on the repo (so the PR it opens triggers CI)
+and the `CLAUDE_CODE_OAUTH_TOKEN` secret.
+
 ## Other workflows
 
 | Workflow | Purpose |

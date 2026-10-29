@@ -1,0 +1,54 @@
+# Copy to <repo>/.github/ISSUE_TEMPLATE/agent-task.yml
+#
+# The spec gate. An agent run only starts from an issue with testable
+# acceptance criteria; this form makes that the path of least resistance.
+# Adding the `agent:claude` label hands it to claude-implement.yml; `jules`
+# hands it to Google Jules.
+name: Agent task
+description: A bounded, testable unit of work for a coding agent to implement
+title: "[agent] "
+labels: ["agent-task"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is wrong or missing, in one or two sentences. Link code paths.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checkable statements. Each one should map to a test, a type check, or a `terraform validate`.
+      value: |
+        - [ ]
+        - [ ]
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: What the agent must not touch, even if it looks related.
+  - type: textarea
+    id: test-plan
+    attributes:
+      label: Verification
+      description: Exact commands that must pass before a PR is opened.
+      placeholder: pytest -q && npx tsc --noEmit
+    validations:
+      required: true
+  - type: dropdown
+    id: stack
+    attributes:
+      label: Stack
+      options:
+        - backend (Python / Lambda)
+        - frontend (Vite + React + TS)
+        - terraform
+        - elixir
+        - ci / workflows
+        - docs
+    validations:
+      required: true
