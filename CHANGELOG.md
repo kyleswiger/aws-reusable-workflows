@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0](https://github.com/kyleswiger/aws-reusable-workflows/compare/v1.1.0...v1.2.0) (2026-10-29)
+
+
+### Features
+
+* claude-implement reusable workflow + agent-task issue form ([#9](https://github.com/kyleswiger/aws-reusable-workflows/issues/9)) ([bdf43ae](https://github.com/kyleswiger/aws-reusable-workflows/commit/bdf43ae546d4688e283a2d59e85becef419dda37))
+
 ## [1.1.0](https://github.com/kyleswiger/aws-reusable-workflows/compare/v1.0.1...v1.1.0) (2026-09-21)
 
 
