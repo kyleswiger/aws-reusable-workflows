@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.1](https://github.com/kyleswiger/aws-reusable-workflows/compare/v1.2.0...v1.2.1) (2026-11-10)
+
+
+### Bug Fixes
+
+* **preview:** grant lambda:InvokeFunction for public Function URLs ([#10](https://github.com/kyleswiger/aws-reusable-workflows/issues/10)) ([9af1839](https://github.com/kyleswiger/aws-reusable-workflows/commit/9af18394dd7008af43a5fc07ed7253452202340c))
+
 ## [1.2.0](https://github.com/kyleswiger/aws-reusable-workflows/compare/v1.1.0...v1.2.0) (2026-10-29)
 
 
